@@ -4,7 +4,6 @@ import base64
 import configparser
 import datetime
 import fcntl
-import getpass
 import hashlib
 import io
 import json
@@ -14,6 +13,7 @@ import shutil
 import secrets
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,6 +41,7 @@ def save_config(path, cfg):
 
 
 def callback_code(address, state):
+    address = address.replace('\x1b[200~', '').replace('\x1b[201~', '')
     parsed = urllib.parse.urlsplit(address.strip())
     if (parsed.scheme != 'http' or parsed.hostname != '127.0.0.1'
             or parsed.port != 53682 or parsed.path != '/'
@@ -58,9 +59,53 @@ def callback_code(address, state):
     return codes[0]
 
 
+def pending_authorisation(client_id, path):
+    if path.is_symlink():
+        raise RuntimeError('The pending sign-in file is a symlink; leaving it unchanged.')
+    if path.exists():
+        pending = json.loads(path.read_text())
+        if (pending.get('client_id') == client_id
+                and 0 <= time.time() - pending.get('created', 0) < 3600
+                and pending.get('state') and pending.get('verifier')):
+            return pending
+    pending = dict(client_id=client_id, state=secrets.token_urlsafe(32),
+                   verifier=secrets.token_urlsafe(64), created=time.time())
+    fd, name = tempfile.mkstemp(prefix='.nas-auth-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(pending, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+    return pending
+
+
+def read_callback(state):
+    # Read the actual SSH terminal, independently of the heredoc on stdin.
+    # Disable bracketed paste while reading; Bash restores its own mode later.
+    with open('/dev/tty', 'r') as terminal, open('/dev/tty', 'w') as display:
+        display.write('\x1b[?2004l')
+        display.flush()
+        while True:
+            display.write('\nPASTE THE FINAL BROWSER ADDRESS HERE, THEN PRESS ENTER:\n> ')
+            display.flush()
+            address = terminal.readline()
+            if not address:
+                raise RuntimeError('Terminal input closed. Rerun to continue the saved sign-in.')
+            try:
+                return callback_code(address, state)
+            except (RuntimeError, ValueError):
+                display.write('Address not accepted yet. Copy the complete 127.0.0.1 address from the Google approval tab and paste it here.\n')
+                display.flush()
+
+
 def authorise_without_tunnel(cfg):
-    state = secrets.token_urlsafe(32)
-    verifier = secrets.token_urlsafe(64)
+    pending_path = Path('/root/.config/rclone/nas-gdrive-pending-auth.json')
+    pending = pending_authorisation(cfg.get('gdrive', 'client_id'), pending_path)
+    state, verifier = pending['state'], pending['verifier']
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
     redirect = 'http://127.0.0.1:53682/'
     params = dict(client_id=cfg.get('gdrive', 'client_id'), redirect_uri=redirect,
@@ -71,9 +116,8 @@ def authorise_without_tunnel(cfg):
     print('https://accounts.google.com/o/oauth2/v2/auth?' + urllib.parse.urlencode(params), flush=True)
     print('\nAfter approval, Chrome will show a localhost connection error. That is expected here.', flush=True)
     print('Copy the COMPLETE address from Chrome (Ctrl+L, Ctrl+C). Paste it below and press Enter.', flush=True)
-    print('The pasted address stays hidden. Paste it in this terminal, not in chat.\n', flush=True)
-    address = getpass.getpass('Final browser address: ')
-    code = callback_code(address, state)
+    print('Paste the address in this terminal. The input stays open until a valid address is received.\n', flush=True)
+    code = read_callback(state)
     payload = urllib.parse.urlencode(dict(client_id=cfg.get('gdrive', 'client_id'),
         client_secret=cfg.get('gdrive', 'client_secret'), code=code,
         code_verifier=verifier, redirect_uri=redirect, grant_type='authorization_code')).encode()
