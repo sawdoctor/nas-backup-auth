@@ -49,6 +49,8 @@ def main():
     rclone = shutil.which('rclone')
     if not rclone:
         raise RuntimeError('rclone is not installed.')
+    subprocess.run([rclone, 'config', 'reconnect', '--help'],
+                   stdout=subprocess.DEVNULL, check=True)
     source = Path('/home/sawdoctor/nas-gdrive-client.json')
     if source.is_symlink() or not source.is_file():
         raise RuntimeError('The NAS client JSON file is missing or is a symlink.')
@@ -100,8 +102,8 @@ def main():
         print('Choose y for auto config / use web browser. Choose n for Shared Drive if asked.', flush=True)
         print('Open the printed http://127.0.0.1:53682/auth?... link in FydeOS Chrome.', flush=True)
         with open('/dev/tty', 'r') as terminal:
-            subprocess.run([rclone, '--config', str(candidate), '--auth-no-open-browser',
-                            'config', 'reconnect', 'gdrive:'], stdin=terminal, check=True)
+            subprocess.run([rclone, 'config', 'reconnect', 'gdrive:',
+                            '--config', str(candidate)], stdin=terminal, check=True)
     cfg = config_from(candidate.read_bytes())
     token = json.loads(cfg.get('gdrive', 'token', fallback='{}'))
     if not token.get('refresh_token'):
