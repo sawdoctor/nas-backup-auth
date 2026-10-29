@@ -99,7 +99,7 @@ def main():
     if not token.get('refresh_token'):
         print('Choose y for auto config / use web browser. Choose n for Shared Drive if asked.', flush=True)
         print('Open the printed http://127.0.0.1:53682/auth?... link in FydeOS Chrome.', flush=True)
-        with open('/dev/tty', 'r+') as terminal:
+        with open('/dev/tty', 'r') as terminal:
             subprocess.run([rclone, '--config', str(candidate), '--auth-no-open-browser',
                             'config', 'reconnect', 'gdrive:'], stdin=terminal, check=True)
     cfg = config_from(candidate.read_bytes())
