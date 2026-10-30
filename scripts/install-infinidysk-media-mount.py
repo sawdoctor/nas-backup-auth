@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -132,7 +133,7 @@ def atomic_text(path, text, mode=0o600):
             os.unlink(temporary)
 
 
-def make_remote(source):
+def make_remote(source, credentials=None):
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(source)
     if cfg.sections() != ['nzbdav'] or cfg.get('nzbdav', 'type', fallback='') != 'webdav':
@@ -142,6 +143,23 @@ def make_remote(source):
         raise RuntimeError('Unexpected original WebDAV URL; leaving it unchanged.')
     cfg.set('nzbdav', 'url', original._replace(scheme='http',
         netloc='192.168.0.220:8082', fragment='').geturl())
+    if credentials is not None:
+        user, password = credentials
+        # A single-remote `config show nzbdav` masks pass as *** ENCRYPTED ***.
+        # Configure a separate NAS WebDAV login instead of copying that placeholder.
+        # Pass the actual password through stdin, never command arguments or logs.
+        result = subprocess.run([str(BINARY), 'obscure', '-'],
+            input=password + '\n', text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=30)
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError('Could not prepare the private NAS WebDAV password.')
+        cfg.set('nzbdav', 'user', user)
+        cfg.set('nzbdav', 'pass', result.stdout.strip())
+        # The new NAS login uses Basic authentication rather than a copied token.
+        cfg.remove_option('nzbdav', 'bearer_token')
+        cfg.remove_option('nzbdav', 'bearer_token_command')
+    elif cfg.get('nzbdav', 'pass', fallback='') == '*** ENCRYPTED ***':
+        raise RuntimeError('The exported WebDAV password is a display placeholder.')
     output = io.StringIO()
     cfg.write(output)
     return output.getvalue()
@@ -230,7 +248,6 @@ def main():
             raise RuntimeError('An unrelated mount already occupies /mnt/nzbdav.')
     elif MOUNT.exists() and (not MOUNT.is_dir() or any(MOUNT.iterdir())):
         raise RuntimeError('/mnt/nzbdav already contains files; leaving it unchanged.')
-    remote = make_remote(snapshot / 'rclone.conf')
     print('Preparing the dedicated media rclone binary and NAS WebDAV configuration...', flush=True)
     with open('/run/lock/sawdoctor-nas-backup.lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -242,7 +259,27 @@ def main():
         if version != 'rclone v1.74.3':
             raise RuntimeError('The exported media binary is not the expected rclone v1.74.3.')
         print('Media mount binary: ' + version, flush=True)
+        environment = service['environment']
+        password_key = 'NZBDAV_CONFIG__WEBDAV__PASS'
+        user_key = 'NZBDAV_CONFIG__WEBDAV__USER'
+        password = environment.get(password_key, '').replace('$$', '$')
+        user = environment.get(user_key, '').replace('$$', '$')
+        if not password or not user:
+            login_backup = stack.parent / 'compose.before-media-login.json'
+            if not login_backup.exists():
+                atomic_text(login_backup, stack.read_text())
+            user, password = 'nas-media', secrets.token_urlsafe(32)
+            # InfiniDysk's documented headless WebDAV PASS accepts plaintext and
+            # hashes it in memory. The persisted clone database is left unchanged.
+            environment[user_key] = user
+            environment[password_key] = password.replace('$', '$$')
+        remote = make_remote(snapshot / 'rclone.conf', (user, password))
+        atomic_text(stack, json.dumps(document, indent=2) + '\n')
         atomic_text(config, remote)
+        print('Applying the private NAS WebDAV login and waiting for the NAS container...', flush=True)
+        run('docker', 'compose', '-f', str(stack), 'config', '--quiet')
+        run('docker', 'compose', '-f', str(stack), 'up', '-d', '--pull', 'never',
+            '--wait', '--wait-timeout', '180', 'infinidysk')
         print('Checking NAS WebDAV login using a directory listing...', flush=True)
         directories = run(str(BINARY), '--config', str(config), '--contimeout', '10s',
             '--timeout', '30s', '--retries', '2', 'lsf', 'nzbdav:', '--dirs-only', '--max-depth', '1', capture=True)
