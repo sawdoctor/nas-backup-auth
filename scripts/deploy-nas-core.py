@@ -2,6 +2,7 @@
 """Deploy Sawdoctor's verified six-app snapshot against NAS media and InfiniDysk."""
 import copy
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -61,6 +63,141 @@ def atomic_text(path, text, mode=None):
 
 def write_json(path, document):
     atomic_text(path, json.dumps(document, indent=2) + '\n')
+
+
+def archive_image_identities(path):
+    """Relate config, manifest and index digests without extracting image layers."""
+    identities, configs = {}, {}
+    with tarfile.open(path, 'r:') as archive:
+        members = {}
+        for member in archive:
+            if not member.isfile():
+                continue
+            name = member.name
+            while name.startswith('./'):
+                name = name[2:]
+            if name in members:
+                raise RuntimeError('Duplicate image archive member.')
+            members[name] = member
+
+        def read_json(name, digest=None):
+            member = members.get(name)
+            if member is None or member.size > 16 * 1024**2:
+                raise RuntimeError('Missing or oversized image identity metadata: ' + name)
+            with archive.extractfile(member) as stream:
+                data = stream.read()
+            actual = 'sha256:' + hashlib.sha256(data).hexdigest()
+            if digest and actual != digest:
+                raise RuntimeError('Image identity metadata failed its digest check.')
+            return actual, json.loads(data)
+
+        def add_config(digest, config):
+            if not isinstance(config, dict) or not isinstance(config.get('rootfs'), dict):
+                raise RuntimeError('Invalid exported image configuration.')
+            configs[digest] = config
+            identities[digest] = {digest}
+
+        if 'manifest.json' in members:
+            _, manifest = read_json('manifest.json')
+            for item in manifest:
+                digest, config = read_json(item['Config'])
+                add_config(digest, config)
+
+        def visit(descriptor, active=frozenset()):
+            digest = descriptor['digest']
+            if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+                raise RuntimeError('Unsupported exported image digest.')
+            if digest in identities:
+                return identities[digest]
+            if digest in active or len(active) > 8:
+                raise RuntimeError('Invalid exported image descriptor graph.')
+            blob = 'blobs/sha256/' + digest.split(':', 1)[1]
+            if blob not in members:
+                # A multi-platform index may describe platforms not saved locally.
+                return set()
+            _, document = read_json(blob, digest)
+            if 'rootfs' in document:
+                add_config(digest, document)
+                return {digest}
+            children = document.get('manifests', [])
+            if 'config' in document:
+                children = [document['config']]
+            found = set()
+            for child in children:
+                found.update(visit(child, active | {digest}))
+            identities[digest] = found
+            return found
+
+        if 'index.json' in members:
+            _, index = read_json('index.json')
+            for descriptor in index.get('manifests', []):
+                visit(descriptor)
+    if not configs:
+        raise RuntimeError('No image configuration identities were found in the export.')
+    return identities, configs
+
+
+def load_verified_images(snapshot, manifest, containers, stack):
+    """Verify config digests across Docker's classic and containerd image stores."""
+    original_ids, original_configs = archive_image_identities(snapshot / 'images.tar')
+    image_metadata = {image['Id']: image for image in manifest.get('images', [])}
+    expected = {}
+    for name, source in containers.items():
+        candidates = original_ids.get(source['Image'], set())
+        metadata = image_metadata.get(source['Image'], {})
+        if metadata.get('Os') and metadata.get('Architecture'):
+            candidates = {digest for digest in candidates
+                if original_configs[digest].get('os') == metadata['Os']
+                and original_configs[digest].get('architecture') == metadata['Architecture']
+                and original_configs[digest].get('variant', '') == metadata.get('Variant', '')}
+        if metadata.get('RootFS', {}).get('Layers'):
+            candidates = {digest for digest in candidates
+                if original_configs[digest]['rootfs'].get('diff_ids') == metadata['RootFS']['Layers']}
+        if len(candidates) != 1:
+            raise RuntimeError('The original image content could not be identified uniquely for ' + name + '.')
+        expected[name] = next(iter(candidates))
+
+    log('Loading the exact exported Docker images...')
+    output = run('docker', 'image', 'load', '--input', str(snapshot / 'images.tar'), capture=True)
+    if output.strip():
+        log(output.strip())
+    references = [line.split(': ', 1)[1].strip() for line in output.splitlines()
+        if line.startswith(('Loaded image ID: ', 'Loaded image: '))]
+    if not references:
+        raise RuntimeError('Docker did not report the images loaded from the export.')
+    loaded = json.loads(run('docker', 'image', 'inspect', *references, capture=True))
+    loaded_ids = sorted({image['Id'] for image in loaded})
+    log('Verifying loaded image contents across Docker storage formats...')
+    with tempfile.TemporaryDirectory(prefix='.image-identity-', dir=stack) as temporary:
+        saved = Path(temporary) / 'loaded-images.tar'
+        run('docker', 'image', 'save', '--output', str(saved), *loaded_ids)
+        nas_ids, nas_configs = archive_image_identities(saved)
+
+    resolved = {}
+    for name, digest in expected.items():
+        config = original_configs[digest]
+        matches = []
+        for image_id in loaded_ids:
+            candidates = {item for item in nas_ids.get(image_id, set())
+                if nas_configs[item].get('os') == config.get('os')
+                and nas_configs[item].get('architecture') == config.get('architecture')
+                and nas_configs[item].get('variant', '') == config.get('variant', '')}
+            if candidates == {digest}:
+                matches.append(image_id)
+        if not matches:
+            raise RuntimeError('The loaded image content differs from the export for ' + name + '.')
+        resolved[name] = matches[0]
+        log(name + ': original image configuration and layer identities verified')
+
+    references = {}
+    for name, source in containers.items():
+        references.setdefault(source['Config']['Image'], set()).add(resolved[name])
+    for reference, image_ids in references.items():
+        if len(image_ids) == 1 and '@' not in reference and not reference.startswith('sha256:'):
+            run('docker', 'image', 'tag', next(iter(image_ids)), reference)
+    write_json(stack / 'image-identities.json', {name: {'source': containers[name]['Image'],
+        'nas': resolved[name], 'config': expected[name]} for name in containers})
+    return resolved
 
 
 def environment(container):
@@ -547,19 +684,15 @@ def main():
             raise RuntimeError('An unrelated core Compose file already exists.')
         if not compose.exists():
             write_json(compose, compose_document(containers, data, library, scratch, ports, keys, infini))
-        tag_ids = {}
-        for source in containers.values():
-            image = source['Config']['Image']
-            tag_ids.setdefault(image, set()).add(source['Image'])
-        log('Loading the exact exported Docker images...')
-        run('docker', 'image', 'load', '--input', str(snapshot / 'images.tar'))
-        for tag, image_ids in tag_ids.items():
-            for image_id in image_ids:
-                loaded = json.loads(run('docker', 'image', 'inspect', image_id, capture=True))[0]
-                if loaded['Id'] != image_id:
-                    raise RuntimeError('An exported image did not retain its expected identity.')
-            if len(image_ids) == 1 and '@' not in tag and not tag.startswith('sha256:'):
-                run('docker', 'image', 'tag', next(iter(image_ids)), tag)
+        resolved = load_verified_images(snapshot, manifest, containers, stack)
+        nas_containers = copy.deepcopy(containers)
+        for name, image_id in resolved.items():
+            nas_containers[name]['Image'] = image_id
+        expected_compose = compose_document(nas_containers, data, library, scratch, ports, keys, infini)
+        compose_doc = json.loads(compose.read_text())
+        for name in containers:
+            compose_doc['services'][name]['image'] = expected_compose['services'][name]['image']
+        write_json(compose, compose_doc)
         network = subprocess.run(['docker', 'network', 'inspect', NETWORK], text=True,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if network.returncode:
