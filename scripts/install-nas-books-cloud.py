@@ -21,6 +21,7 @@ BINARY = Path('/usr/local/libexec/infinidysk-rclone')
 HELPER = Path('/usr/local/sbin/nas-books-cloud-helper')
 UNITS = Path('/etc/systemd/system')
 LOCK = Path('/run/lock/sawdoctor-nas-backup.lock')
+BACKUP_CONFIG = Path('/root/.config/rclone/rclone.conf')
 SIGNATURE = 'Sawdoctor NAS books cloud mounts v1'
 MOUNTS = {
     'gdrive-audiobooks': {'remote': 'gdrive:Soundspan-Audiobooks', 'target': '/mnt/gdrive-audiobooks', 'readOnly': True},
@@ -136,6 +137,42 @@ def copied_config(snapshot, manifest):
         result[remote] = dict(source.items(remote))
     output = io.StringIO();result.write(output)
     return output.getvalue()
+
+
+def use_nas_drive_auth(media_path):
+    """Reuse the authorised NAS client in a separate media config file."""
+    media = configparser.ConfigParser(interpolation=None)
+    backup = configparser.ConfigParser(interpolation=None)
+    try:
+        media.read_string(media_path.read_text())
+        backup.read_string(BACKUP_CONFIG.read_text())
+    except (configparser.Error, UnicodeError):
+        raise RuntimeError('Could not read the private NAS Drive configurations; no credentials were printed.') from None
+    if backup.get('gdrive', 'type', fallback='') != 'drive':
+        raise RuntimeError('The existing NAS backup Drive remote was not found.')
+    client_id = backup.get('gdrive', 'client_id', fallback='').strip()
+    client_secret = backup.get('gdrive', 'client_secret', fallback='').strip()
+    token = backup.get('gdrive', 'token', fallback='').strip()
+    try:
+        valid_refresh = bool(json.loads(token).get('refresh_token'))
+    except (ValueError, AttributeError):
+        valid_refresh = False
+    if not client_id or not client_secret or not valid_refresh:
+        raise RuntimeError('The existing NAS backup configuration lacks its custom Drive client or refresh token.')
+    if (media.get('gdrive', 'client_id', fallback='').strip() == client_id
+        and media.get('gdrive', 'client_secret', fallback='').strip() == client_secret):
+        # Each rclone process can refresh its access token. Do not replace a
+        # working media token every time the installer is rerun.
+        try:
+            if json.loads(media.get('gdrive', 'token', fallback='')).get('refresh_token'):
+                return False
+        except (ValueError, AttributeError):
+            pass
+    for key, value in (('client_id', client_id), ('client_secret', client_secret), ('token', token)):
+        media.set('gdrive', key, value)
+    output = io.StringIO();media.write(output)
+    atomic_text(media_path, output.getvalue())
+    return True
 
 
 def mount_command(name, spec, original, config, cache):
@@ -327,7 +364,12 @@ def main():
         original = manifest['hostUnits']['rclone-' + name + '.service']
         cache = cache_root / name
         command = mount_command(name, spec, original, config, cache)
-        plans.append((name, spec, target, unit, cache, command, original.get('RcloneEnvironment', {})))
+        values = dict(original.get('RcloneEnvironment', {}))
+        if name.startswith('gdrive-'):
+            for key in ('RCLONE_CONFIG_GDRIVE_CLIENT_ID', 'RCLONE_CONFIG_GDRIVE_CLIENT_SECRET',
+                'RCLONE_CONFIG_GDRIVE_TOKEN', 'RCLONE_DRIVE_CLIENT_ID', 'RCLONE_DRIVE_CLIENT_SECRET', 'RCLONE_DRIVE_TOKEN'):
+                values.pop(key, None)
+        plans.append((name, spec, target, unit, cache, command, values))
     log('Preparing separate NAS media credentials and scratch caches...')
     with open(LOCK, 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -339,6 +381,8 @@ def main():
             atomic_text(marker_path, json.dumps(marker, indent=2) + '\n')
         if not config.exists():
             atomic_text(config, prepared)
+        auth_changed = use_nas_drive_auth(config)
+        log('Book media uses the existing authorised NAS Google client in its separate configuration.')
         atomic_text(document_path, json.dumps({'format': SIGNATURE, 'mounts': MOUNTS}, indent=2) + '\n')
         helper = HELPER_SOURCE.replace('__DOCUMENT__', str(document_path)).replace('__FUSERMOUNT__', fusermount).replace('__LOCK__', str(LOCK))
         atomic_text(HELPER, helper, 0o755)
@@ -361,9 +405,12 @@ def main():
             create_mount_directory(target)
             cache.mkdir(parents=True, mode=0o700, exist_ok=True)
             environment = data / 'environment' / (name + '.env')
-            atomic_text(environment, environment_file(values))
+            env_text = environment_file(values)
+            environment_changed = not environment.exists() or environment.read_text() != env_text
+            atomic_text(environment, env_text)
             text = unit_text(name, command, environment)
-            changes[name] = not unit.exists() or unit.read_text() != text
+            changes[name] = (not unit.exists() or unit.read_text() != text or environment_changed
+                or (auth_changed and name.startswith('gdrive-')))
             atomic_text(unit, text, 0o644)
         run('systemctl', 'daemon-reload')
         run('systemctl', 'enable', *(unit.name for _, _, _, unit, _, _, _ in plans))
@@ -376,7 +423,9 @@ def main():
             raise RuntimeError('The cloud mount did not retain its expected identity: ' + name)
         log(str(target) + ': ready (' + ('read-only' if spec['readOnly'] else 'read/write') + ')')
     marker['completed'] = True
+    marker['driveClient'] = 'Existing NAS custom client; separate media configuration'
     atomic_text(marker_path, json.dumps(marker, indent=2) + '\n')
+    (data / 'preflight-error.log').unlink(missing_ok=True)
     log('\nNAS BOOK CLOUD MOUNTS READY. The NAS backup login and existing media stack were retained.')
     log('Book applications have not been deployed yet. The following inventory is for their NAS connections.')
     routing_report(snapshot, manifest)
