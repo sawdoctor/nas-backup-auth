@@ -126,12 +126,19 @@ def ssh_authorization(account, write=False):
         atomic_text(path, '\n'.join(lines) + '\n', owner=(account.pw_uid, account.pw_gid))
 
 
+def data_roots():
+    # A Docker container in "created" state may never have created its bind
+    # directories. Preserve its definition without inventing source data.
+    return {name: source for name, source in ROOTS.items()
+        if name != 'rdtclient-books' or Path(source).exists() or Path(source).is_symlink()}
+
+
 def inspect_targets():
     containers = json.loads(run('docker', 'inspect', *CONTAINERS, capture=True))
     by_name = {c['Name'].lstrip('/'): c for c in containers}
     if set(by_name) != set(CONTAINERS):
         raise RuntimeError('The book application containers do not match the inventory.')
-    for label, source in ROOTS.items():
+    for label, source in data_roots().items():
         path = Path(source)
         if path.is_symlink() or not path.is_dir():
             raise RuntimeError('Expected a real local data directory: ' + label)
@@ -171,7 +178,7 @@ def resume():
 
 
 def sync_data(work, live=False):
-    for name, source in ROOTS.items():
+    for name, source in data_roots().items():
         target = work / 'data' / name
         target.mkdir(parents=True, exist_ok=True)
         args = ['rsync', '-aHAX', '--numeric-ids', '--one-file-system', '--no-devices', '--no-specials', '--delete']
@@ -300,7 +307,7 @@ def export_books():
     (work / 'compose').mkdir()
     image_ids = sorted({c['Image'] for c in containers.values()})
     images = json.loads(run('docker', 'image', 'inspect', *image_ids, capture=True))
-    size_output = run('du', '-sbx', '--', *ROOTS.values(), capture=True)
+    size_output = run('du', '-sbx', '--', *data_roots().values(), capture=True)
     config_size = sum(int(line.split()[0]) for line in size_output.splitlines())
     image_size = sum(item.get('Size', 0) for item in images)
     if shutil.disk_usage(BASE).free < 2 * (config_size + image_size) + 2 * 1024**3:
@@ -308,7 +315,8 @@ def export_books():
     manifest = {'format': 'sawdoctor-books-export-v1', 'sourceHost': '192.168.0.29',
         'createdUtc': stamp, 'containers': list(containers.values()), 'images': images,
         'dataRoots': {name: {'source': source, 'snapshot': 'data/' + name}
-            for name, source in ROOTS.items()}, 'composeFiles': [], 'hostFiles': []}
+            for name, source in data_roots().items()}, 'composeFiles': [], 'hostFiles': [],
+        'missingDormantDataRoots': {name: source for name, source in ROOTS.items() if name not in data_roots()}}
     compose_paths = set()
     for c in containers.values():
         labels = c['Config'].get('Labels') or {}
@@ -319,6 +327,11 @@ def export_books():
     for source in sorted(compose_paths):
         path = Path(source)
         if not path.is_file() or path.is_symlink():
+            owners = [container for container in containers.values() if source in
+                (container['Config'].get('Labels') or {}).get('com.docker.compose.project.config_files', '').split(',')]
+            if owners and all(container['Name'] == '/rdtclient-books' and not container['State']['Running'] for container in owners):
+                log('Dormant RDTClient Compose source is unavailable; its resolved container definition is retained.')
+                continue
             raise RuntimeError('An original Compose source is missing or unexpected: ' + source)
         name = hashlib.sha256(source.encode()).hexdigest()[:12] + '-' + path.name
         shutil.copy2(path, work / 'compose' / name)
