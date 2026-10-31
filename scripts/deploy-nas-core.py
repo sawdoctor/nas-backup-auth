@@ -447,6 +447,29 @@ def compose_document(containers, data, library, scratch, ports, keys, infini):
     return result
 
 
+def allow_nas_hosts(document, data):
+    """Extend existing host restrictions; preserve all other NAS app settings."""
+    document = copy.deepcopy(document)
+    for name in ('sonarr', 'radarr', 'radarr4k', 'prowlarr'):
+        env = document['services'][name]['environment']
+        prefix = 'RADARR' if name == 'radarr4k' else name.upper()
+        setting = prefix + '__SERVER__ALLOWEDHOSTS'
+        overrides = [key for key in env if key.upper() == setting]
+        root = ET.parse(data / name / 'config.xml').getroot()
+        value = env[overrides[0]].replace('$$', '$') if overrides else (root.findtext('AllowedHosts') or '')
+        hosts = [item.strip() for item in re.split('[,;]', value) if item.strip()]
+        # An empty list or a bare wildcard already permits the NAS address.
+        if not hosts or '*' in hosts:
+            continue
+        for host in ('192.168.0.220', name, name + '-nas'):
+            if host.lower() not in {item.lower() for item in hosts}:
+                hosts.append(host)
+        for key in overrides:
+            del env[key]
+        env[setting] = ','.join(hosts).replace('$', '$$')
+    return document
+
+
 def connect_infini(document, keys, ports, db_settings):
     document = copy.deepcopy(document)
     service = document['services']['infinidysk']
@@ -692,6 +715,13 @@ def main():
         compose_doc = json.loads(compose.read_text())
         for name in containers:
             compose_doc['services'][name]['image'] = expected_compose['services'][name]['image']
+        adjusted = allow_nas_hosts(compose_doc, data)
+        if adjusted != compose_doc:
+            host_backup = stack / 'compose.before-nas-hosts.json'
+            if not host_backup.exists():
+                atomic_text(host_backup, compose.read_text(), 0o600)
+            log('Adding the NAS address to copied application allowed-host lists...')
+        compose_doc = adjusted
         write_json(compose, compose_doc)
         network = subprocess.run(['docker', 'network', 'inspect', NETWORK], text=True,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
