@@ -199,7 +199,7 @@ def verify_wizarr_switch(image):
                     if 'FLASK_SKIP_SCHEDULER' in text:return True
         return False
     finally:
-        run('docker','rm',temporary_id,capture=True)
+        run('docker','rm','--volumes',temporary_id,capture=True)
 
 
 def compose_document(containers,manifest,resolved,wizarr_enabled):
