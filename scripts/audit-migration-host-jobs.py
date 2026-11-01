@@ -73,7 +73,11 @@ def script_info(path):
     text = read(path)
     if not text or not (path.suffix.lower() in SCRIPT_SUFFIXES or text.startswith('#!')):
         return None
-    return {'path': str(path), 'hash': hashlib.sha256(path.read_bytes()).hexdigest(),
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return {'path': str(path), 'hash': digest,
             'topics': topics(str(path) + '\n' + text), 'references': references(text)}
 
 
@@ -223,16 +227,16 @@ def scan_scripts(roots, referenced):
         if limited:
             break
     # Follow literal script references from jobs and other scripts, to depth 4.
-    pending = set(referenced)
+    pending = set(referenced) | {reference for info in found.values() for reference in info['references']}
+    seen = set()
     for _ in range(4):
         extra = set()
-        for value in sorted(pending):
-            if value in found:
-                continue
-            info = script_info(Path(value))
+        for value in sorted(pending - seen):
+            seen.add(value)
+            info = found.get(value) or script_info(Path(value))
             if info:
                 found[value] = info; extra.update(info['references'])
-        pending = extra - set(found)
+        pending = extra - seen
     print('\nHOST / CUSTOM SCRIPT FILES')
     for path, info in sorted(found.items()):
         print(path + ' | sha256=' + info['hash'][:16] + ' | ' + ', '.join(info['topics']))
