@@ -77,6 +77,36 @@ def helpers():
     return module
 
 
+def resolve_images(verifier,manifest,containers):
+    """Reuse the previously verified immutable NAS IDs on a deployment retry."""
+    cache=STACK/'image-identities.json'
+    if cache.is_file() and not cache.is_symlink():
+        try:
+            records=json.loads(cache.read_text())
+            if set(records)!=set(containers):raise ValueError('image list changed')
+            archive_ids,configs=verifier.archive_image_identities(SNAPSHOT/'images.tar')
+            references=[]
+            for name,source in containers.items():
+                record=records[name]
+                if record['source']!=source['Image'] or record['config'] not in archive_ids.get(source['Image'],set()):
+                    raise ValueError('export identity changed')
+                if not re.fullmatch(r'sha256:[0-9a-f]{64}',record['nas']):raise ValueError('invalid NAS identity')
+                references.append(record['nas'])
+            inspected=json.loads(run('docker','image','inspect',*sorted(set(references)),capture=True,stderr=subprocess.DEVNULL))
+            by_id={item['Id']:item for item in inspected}
+            for record in records.values():
+                image=by_id[record['nas']];config=configs[record['config']]
+                if (image.get('Os')!=config.get('os') or image.get('Architecture')!=config.get('architecture')
+                    or image.get('Variant','')!=config.get('variant','')
+                    or image.get('RootFS',{}).get('Layers')!=config['rootfs'].get('diff_ids')):
+                    raise ValueError('loaded image metadata changed')
+            log('Reusing all previously verified NAS image identities; no image reload is needed.')
+            return {name:record['nas'] for name,record in records.items()}
+        except (KeyError,ValueError,OSError,subprocess.CalledProcessError):
+            log('The saved image identities need fresh verification.')
+    return verifier.load_verified_images(SNAPSHOT,manifest,containers,STACK)
+
+
 def rewrite_urls(value):
     if not isinstance(value,str): return value
     def address(match):
@@ -257,6 +287,45 @@ def psql(sql):
     return result.stdout.strip()
 
 
+def tracearr_test_sql(schema):
+    """Choose verified controls from the actual database schema, before writing."""
+    def require(table,columns):
+        found=schema.get(table,{})
+        for column,kind in columns.items():
+            if column not in found or (kind and found[column]!=kind):
+                raise RuntimeError('The copied Tracearr schema lacks the expected '+table+'.'+column+' control.')
+    require('settings',{'name':None,'value':'jsonb'})
+    require('notification_preferences',{'push_enabled':'boolean'})
+    statements=['BEGIN;']
+    settings={'pollerEnabled':False,'mobileEnabled':False,'backupScheduleType':'disabled',
+        'imagePrecacheEnabled':False,'pluginUpdateCheckEnabled':False,
+        'externalUrl':'http://192.168.0.220:7330'}
+    if 'automations' in schema:
+        # Tracearr v3: rules became automations; outbound delivery lives in
+        # destinations and newsletters, with encrypted credentials retained.
+        controls={'automations':{'is_active':'boolean'},'destinations':{'enabled':'boolean'},
+            'newsletters':{'enabled':'boolean'},'request_services':{'enabled':'boolean'}}
+        for table,columns in controls.items():
+            require(table,columns)
+            statements.append('UPDATE public."'+table+'" SET "'+next(iter(columns))+'"=false;')
+        settings['serverUpdateCheckEnabled']=False
+    elif 'rules' in schema:
+        require('rules',{'is_active':'boolean'})
+        require('notification_channel_routing',{'discord_enabled':'boolean','webhook_enabled':'boolean','push_enabled':'boolean'})
+        statements.extend(['UPDATE public.rules SET is_active=false;',
+            'UPDATE public.notification_channel_routing SET discord_enabled=false,webhook_enabled=false,push_enabled=false;'])
+        settings.update({name:None for name in ('discordWebhookUrl','customWebhookUrl','ntfyTopic',
+            'ntfyAuthToken','pushoverUserKey','pushoverApiToken')})
+    else:
+        raise RuntimeError('The copied Tracearr schema has neither supported automation layout.')
+    statements.append('UPDATE public.notification_preferences SET push_enabled=false;')
+    values=["('"+name+"','"+json.dumps(value).replace("'","''")+"'::jsonb)" for name,value in settings.items()]
+    statements.append('INSERT INTO public.settings(name,value) VALUES '+','.join(values)+
+        ' ON CONFLICT(name) DO UPDATE SET value=excluded.value;')
+    statements.append('COMMIT;')
+    return '\n'.join(statements)
+
+
 def prepare_tracearr():
     deadline=time.monotonic()+120
     while True:
@@ -268,22 +337,16 @@ def prepare_tracearr():
     version=psql('SHOW server_version;')
     if not version.startswith('16.'):
         raise RuntimeError('NAS Tracearr did not start with the original PostgreSQL major version 16.')
-    # SQL is applied only before the frontend is first started. No history,
-    # account records, server tokens, or existing libraries are removed.
-    psql('''BEGIN;
-UPDATE rules SET is_active=false;
-UPDATE notification_preferences SET push_enabled=false;
-UPDATE notification_channel_routing SET discord_enabled=false,webhook_enabled=false,push_enabled=false;
-INSERT INTO settings(name,value) VALUES
- ('pollerEnabled','false'::jsonb), ('mobileEnabled','false'::jsonb),
- ('discordWebhookUrl','null'::jsonb), ('customWebhookUrl','null'::jsonb),
- ('ntfyTopic','null'::jsonb), ('ntfyAuthToken','null'::jsonb),
- ('pushoverUserKey','null'::jsonb), ('pushoverApiToken','null'::jsonb),
- ('backupScheduleType','"disabled"'::jsonb), ('imagePrecacheEnabled','false'::jsonb),
- ('pluginUpdateCheckEnabled','false'::jsonb), ('externalUrl','"http://192.168.0.220:7330"'::jsonb)
-ON CONFLICT(name) DO UPDATE SET value=excluded.value;
-COMMIT;''')
-    log('Tracearr: PostgreSQL 16 restored; polling, rules and copied notifications paused.')
+    schema=json.loads(psql("""SELECT COALESCE(json_object_agg(table_name,columns),'{}'::json)
+FROM (SELECT table_name,json_object_agg(column_name,data_type) AS columns
+FROM information_schema.columns WHERE table_schema='public' GROUP BY table_name) AS inventory;"""))
+    sql=tracearr_test_sql(schema)
+    # Validate the entire schema before a single transaction changes test flags.
+    # No history, accounts, server tokens or encrypted notification config changes.
+    psql(sql)
+    (STACK/'tracearr-database-error.log').unlink(missing_ok=True)
+    layout='v3 automations/destinations' if 'automations' in schema else 'v2 rules'
+    log('Tracearr: PostgreSQL 16 restored using '+layout+'; polling, actions and copied notifications paused.')
 
 
 def check_http(names):
@@ -352,7 +415,7 @@ def main():
         path=STACK/'compose.json'
         if path.exists() and json.loads(path.read_text()).get('x-sawdoctor-managed')!=SIGNATURE:
             raise RuntimeError('An unrelated support Compose definition exists.')
-        resolved=verifier.load_verified_images(SNAPSHOT,manifest,containers,STACK)
+        resolved=resolve_images(verifier,manifest,containers)
         if not path.exists():
             wizarr=verify_wizarr_switch(resolved['wizarr'])
             write_json(path,compose_document(containers,manifest,resolved,wizarr))
