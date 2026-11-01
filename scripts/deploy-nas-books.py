@@ -145,6 +145,9 @@ def rewrite_url(value, browser=False):
 
 
 def rewrite_tree(value, key=''):
+    # Kavita stores enum setting keys as SQLite integers. Normalize the key
+    # for routing classification without changing stored keys or value types.
+    key = '' if key is None else str(key)
     if isinstance(value, dict):
         return {name: rewrite_tree(item, str(name)) for name, item in value.items()}
     if isinstance(value, list):
