@@ -36,7 +36,8 @@ def load_review(snapshot):
             raise RuntimeError('A copied host-job file failed its integrity check.')
         unit = str(source).startswith('/etc/systemd/')
         cron = str(source).startswith(('/etc/cron', '/var/spool/cron/'))
-        if entry.get('script') or unit or cron:
+        settings = source.suffix.lower() in ('.env', '.ini', '.conf') or source.name.startswith('.env')
+        if (entry.get('script') and not settings) or unit or cron:
             result['files'].append({'source': str(source), 'sha256': entry['sha256'],
                                     'content': data.decode('utf-8', errors='replace')})
         else:
