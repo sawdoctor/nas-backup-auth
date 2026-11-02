@@ -96,25 +96,100 @@ def storage(mode='inspect', stacks=None):
                           input=json.dumps(payload)))
 
 
-def literal_tree(value):
-    if isinstance(value, str):
-        return value.replace('$', '$$')
-    if isinstance(value, list):
-        return [literal_tree(item) for item in value]
-    if isinstance(value, dict):
-        return {key: literal_tree(item) for key, item in value.items()}
-    return value
+def runtime_environment_value(value):
+    # `compose config` emits a reusable Compose model: literal dollars in
+    # environment values are already escaped as $$. Docker inspect shows
+    # the single-dollar runtime value. Decode once only for this comparison;
+    # the editable Compose document must keep the exported escaping intact.
+    return str(value).replace('$$', '$')
 
 
-def compose_model(project, paths, directory):
+def changed_paths(expected, current, prefix=''):
+    if type(expected) is not type(current):
+        return [prefix or '<root>']
+    if isinstance(expected, dict):
+        result = []
+        for key in sorted(expected.keys() | current.keys()):
+            path = prefix + ('.' if prefix else '') + str(key)
+            if key not in expected or key not in current:
+                result.append(path)
+            else:
+                result.extend(changed_paths(expected[key], current[key], path))
+        return result
+    if isinstance(expected, list):
+        if len(expected) != len(current):
+            return [prefix]
+        result = []
+        for index, (left, right) in enumerate(zip(expected, current)):
+            result.extend(changed_paths(left, right, prefix + '[' + str(index) + ']'))
+        return result
+    return [] if expected == current else [prefix or '<root>']
+
+
+def compose_model(project, paths, directory, allow_missing_environment=False):
     command = ['docker', 'compose', '-p', project, '--project-directory', str(directory), '--profile', '*']
     for path in paths:
         command += ['-f', str(path)]
     result = subprocess.run(command + ['config', '--format', 'json'], text=True, capture_output=True, timeout=90)
-    if result.returncode or ('variable' in result.stderr.lower() and 'not set' in result.stderr.lower()):
+    if result.returncode or (not allow_missing_environment and 'variable' in result.stderr.lower() and 'not set' in result.stderr.lower()):
         atomic(WORK / ('compose-error-' + project + '.log'), (result.stdout + result.stderr).encode())
         raise RuntimeError('The original Compose definition could not be resolved safely: ' + project)
     return json.loads(result.stdout)
+
+
+def different_locations(expected, current, path=()):
+    if type(expected) is not type(current):
+        return [path]
+    if isinstance(expected, dict):
+        result = []
+        for key in expected.keys() | current.keys():
+            if key not in expected or key not in current:
+                result.append(path + (key,))
+            else:
+                result.extend(different_locations(expected[key], current[key], path + (key,)))
+        return result
+    if isinstance(expected, list):
+        if len(expected) != len(current):
+            return [path]
+        result = []
+        for index, (left, right) in enumerate(zip(expected, current)):
+            result.extend(different_locations(left, right, path + (index,)))
+        return result
+    return [] if expected == current else [path]
+
+
+def editable_export(project, expected, directory, prepared, yaml):
+    definition = copy.deepcopy(expected)
+    rewritten = set()
+    # Environment values from config are already dollar-escaped. Some CLI
+    # versions serialize other fields differently. Only adjust a field when
+    # a real CLI round trip demonstrates that it needs escaping, then require
+    # the entire resolved model to match before any stack is imported.
+    for _attempt in range(3):
+        text = yaml.safe_dump(definition, sort_keys=False, allow_unicode=True)
+        atomic(prepared, text.encode())
+        rendered = compose_model(project, [prepared], directory, allow_missing_environment=True)
+        if rendered == expected:
+            compose_model(project, [prepared], directory)
+            return text
+        adjusted = False
+        for location in different_locations(expected, rendered):
+            if not location or location in rewritten:
+                continue
+            left, target = expected, definition
+            try:
+                for key in location[:-1]:
+                    left, target = left[key], target[key]
+                value = left[location[-1]]
+            except (KeyError, IndexError, TypeError):
+                continue
+            if isinstance(value, str) and '$' in value:
+                target[location[-1]] = value.replace('$', '$$')
+                rewritten.add(location); adjusted = True
+        if not adjusted:
+            break
+    fields = ', '.join(changed_paths(expected, rendered)[:8])
+    raise RuntimeError('The editable Compose export changed settings during validation: ' + project + ' / ' + fields + '. Values were not displayed.')
 
 
 def discover(containers):
@@ -151,8 +226,8 @@ def validate_live(model, containers):
             raise RuntimeError('An image reference differs between Compose and its existing container: ' + key)
         current_env = dict(item.split('=', 1) for item in container['Config'].get('Env', []) if '=' in item)
         for name, value in service.get('environment', {}).items():
-            if value is not None and current_env.get(name) != str(value):
-                raise RuntimeError('A configured environment value differs from the existing container: ' + key + '. Its value was not displayed.')
+            if value is not None and current_env.get(name) != runtime_environment_value(value):
+                raise RuntimeError('A configured environment value differs from the existing container: ' + key + ' / ' + name + '. Its value was not displayed.')
         for mount in service.get('volumes', []):
             if mount.get('type') != 'bind':
                 continue
@@ -209,11 +284,8 @@ def prepare(groups, previous, yaml):
                 raise RuntimeError('Kometa is running; its schedule/profile needs review before adoption.')
             expected['services']['kometa']['profiles'] = ['plex-cutover']
         expected['x-sawdoctor-dockmon-import'] = SIGNATURE
-        text = yaml.safe_dump(literal_tree(expected), sort_keys=False, allow_unicode=True)
         prepared = WORK / 'prepared' / (project + '.yaml')
-        atomic(prepared, text.encode())
-        if compose_model(project, [prepared], directory) != expected:
-            raise RuntimeError('The editable Compose export changed settings during validation: ' + project)
+        text = editable_export(project, expected, directory, prepared, yaml)
         plan['stacks'][project] = text
         canonical = DATA / 'stacks' / project / 'compose.yaml'
         for number, path in enumerate(paths):
