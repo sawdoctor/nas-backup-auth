@@ -9,9 +9,9 @@ import pwd
 import shlex
 import shutil
 import signal
-import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -46,6 +46,14 @@ TARGETS = {
     'npm-app-1': {'/data': 'npm-data', '/etc/letsencrypt': 'npm-letsencrypt'},
 }
 PLEX_DB = Path('Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db')
+CHECK_SCRIPT = '''set -eu
+tar -xf - -C /check
+for database in plex.db npm.db; do
+  test -s "/check/$database"
+  "/usr/lib/plexmediaserver/Plex SQLite" "/check/$database" \
+    "PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA quick_check;"
+done
+'''
 
 
 def say(message):
@@ -228,37 +236,53 @@ def cold_copy(work, containers):
 
 
 def verify(work):
-    database = work / 'data/npm-data/database.sqlite'
-    connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)
-    try:
-        if connection.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
-            raise RuntimeError('The copied NPM database did not pass its integrity check.')
-    finally:
-        connection.close()
-    # Run the bundled SQLite utility, never the Plex server, against only the
-    # copied data. Its customized engine understands the existing Plex schema.
-    result = run('docker', 'run', '--rm', '--network', 'none', '--read-only',
-        '--mount', 'type=bind,source=' + str(work / 'data/plex-config') + ',target=/snapshot,readonly',
-        '--env', 'LD_LIBRARY_PATH=/usr/lib/plexmediaserver',
-        '--entrypoint', '/usr/lib/plexmediaserver/Plex SQLite', IMAGES['plex'],
-        '-readonly', '/snapshot/' + str(PLEX_DB), 'PRAGMA quick_check;', timeout=1800)
-    if result.strip() != 'ok':
-        atomic(BASE / 'plex-database-check.log', result)
-        raise RuntimeError('The copied Plex database did not pass its integrity check; private results were retained.')
     preferences = work / 'data/plex-config/Library/Application Support/Plex Media Server/Preferences.xml'
     values = ET.parse(preferences).getroot().attrib
     if not values.get('MachineIdentifier'):
         raise RuntimeError('The copied Plex server identity is unavailable.')
+    databases = {'plex.db': work / 'data/plex-config' / PLEX_DB,
+                 'npm.db': work / 'data/npm-data/database.sqlite'}
+    # Stream only disposable database copies into a Docker-owned anonymous
+    # volume. SQLite may create/rebuild WAL/SHM support files there. Neither
+    # the snapshot nor any live application directory is mounted or written.
+    # --rm removes the utility container and its anonymous volume at exit.
+    with tempfile.TemporaryDirectory(prefix='.database-check-', dir=BASE) as temporary:
+        packet = Path(temporary) / 'databases.tar'
+        with tarfile.open(packet, 'w') as archive:
+            for alias, database in databases.items():
+                if not database.is_file():
+                    raise RuntimeError('The saved snapshot is missing its ' + alias + ' database.')
+                for suffix in ('', '-wal', '-shm', '-journal'):
+                    source = Path(str(database) + suffix)
+                    if not source.exists():
+                        continue
+                    if not source.is_file() or not source.resolve().is_relative_to(work.resolve()):
+                        raise RuntimeError('An exported database/support file points outside the saved snapshot.')
+                    info = tarfile.TarInfo(alias + suffix)
+                    info.size = source.stat().st_size
+                    info.mode = 0o600
+                    info.uid = info.gid = 0
+                    with source.open('rb') as data:
+                        archive.addfile(info, data)
+        with packet.open('rb') as data:
+            result = run('docker', 'run', '--rm', '-i', '--pull', 'never',
+                '--network', 'none', '--read-only', '--user', '0:0', '--volume', '/check',
+                '--env', 'LD_LIBRARY_PATH=/usr/lib/plexmediaserver',
+                '--entrypoint', '/bin/sh', IMAGES['plex'], '-c', CHECK_SCRIPT,
+                stdin=data, timeout=1800)
+    if result.split() != ['ok', 'ok']:
+        atomic(BASE / 'plex-database-check.log', result)
+        raise RuntimeError('The disposable Plex/NPM database checks did not pass; private results were retained.')
     say('Copied Plex and NPM databases passed their checks; Plex preferences and identity are present.')
 
 
 def check_sqlite_tool():
-    run('docker', 'run', '--rm', '--network', 'none', '--read-only',
+    run('docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--read-only', '--user', '0:0',
         '--env', 'LD_LIBRARY_PATH=/usr/lib/plexmediaserver',
         '--entrypoint', '/usr/lib/plexmediaserver/Plex SQLite', IMAGES['plex'], '-version')
 
 
-def export():
+def export(reuse_only=False):
     resume()
     account = pwd.getpwnam('sawdoctor')
     owner = (account.pw_uid, account.pw_gid)
@@ -268,6 +292,14 @@ def export():
         atomic(OUTPUT / 'export.sha256', file_hash(archive) + '  export.tar.zst\n', owner=owner)
         say('PLEX/NPM EXPORT READY: ' + str(archive))
         return
+    work = BASE / 'snapshot-work'
+    saved = saved_snapshot(work)
+    if saved:
+        say('Reusing the completed cold snapshot. Production Plex and NPM will stay running...')
+        finish_export(work, saved, account)
+        return
+    if reuse_only:
+        raise RuntimeError('A completed saved snapshot could not be identified; production apps were not paused.')
     containers = inspect_targets()
     if not all(item['State']['Running'] for item in containers.values()):
         raise RuntimeError('Plex and NPM must be running before the initial source snapshot.')
@@ -307,6 +339,51 @@ def export():
     say('Pre-copying Plex configuration, Flora library links and NPM data/certificates while the source apps run...')
     sync(work, live=True)
     cold_copy(work, containers)
+    manifest['snapshotState'] = 'copied'
+    atomic(work / 'manifest.json', json.dumps(manifest, indent=2) + '\n')
+    finish_export(work, manifest, account)
+
+
+def saved_snapshot(work):
+    if not work.exists():
+        return None
+    marker = work / 'manifest.json'
+    if work.is_symlink() or not marker.is_file():
+        raise RuntimeError('Unrecognized source staging files were retained.')
+    manifest = json.loads(marker.read_text())
+    if (manifest.get('format') != FORMAT or manifest.get('sourceHost') != '192.168.0.29'
+            or {item['Name'].lstrip('/'): item['Image'] for item in manifest.get('containers', [])} != IMAGES
+            or manifest.get('dataRoots') != {label: {'source': source, 'snapshot': 'data/' + label}
+                                            for label, source in ROOTS.items()}):
+        raise RuntimeError('The existing source snapshot differs from the recorded Plex/NPM export.')
+    if manifest.get('snapshotState') == 'copied':
+        return manifest
+    # The first exporter predates the completion marker. Its specific failed
+    # verification command was reached only after cold-copy and recovery.
+    error_path = BASE / 'private-error.log'
+    previous = error_path.read_text(errors='replace') if error_path.is_file() else ''
+    expected = 'unable to open database "/snapshot/' + str(PLEX_DB) + '"'
+    if expected in previous and 'unable to open database file' in previous and not STATE.exists():
+        manifest['snapshotState'] = 'copied'
+        atomic(marker, json.dumps(manifest, indent=2) + '\n')
+        return manifest
+    return None
+
+
+def finish_export(work, manifest, account):
+    owner = (account.pw_uid, account.pw_gid)
+    archive = OUTPUT / 'export.tar.zst'
+    database_bytes = 0
+    for database in (work / 'data/plex-config' / PLEX_DB, work / 'data/npm-data/database.sqlite'):
+        for suffix in ('', '-wal', '-shm', '-journal'):
+            path = Path(str(database) + suffix)
+            if path.is_file():
+                database_bytes += path.stat().st_size
+    work_bytes = int(run('du', '-sbx', '--', str(work)).split()[0])
+    image_bytes = sum(item.get('Size', 0) for item in manifest.get('images', []))
+    if shutil.disk_usage(BASE).free < max(2 * database_bytes, work_bytes + image_bytes) + 2 * 1024**3:
+        raise RuntimeError('More free source disk space is needed for disposable checks and the transfer archive.')
+    say('Checking disposable database copies; the saved snapshot stays unchanged...')
     verify(work)
     say('Saving the exact current Plex and NPM images...')
     run('docker', 'image', 'save', '--output', str(work / 'images.tar'), *IMAGES.values(), timeout=1800)
@@ -325,12 +402,16 @@ def export():
     partial.replace(archive)
     atomic(OUTPUT / 'export.sha256', file_hash(archive) + '  export.tar.zst\n', owner=owner)
     shutil.rmtree(work)
+    (BASE / 'private-error.log').unlink(missing_ok=True)
     say('PLEX/NPM EXPORT READY: ' + str(archive))
-    say('Plex version retained: ' + version + '. NAS deployment and public routing were not changed.')
+    say('Plex version retained: ' + manifest['plexVersion'] + '. NAS deployment and public routing were not changed.')
     say('Temporary source staging removed; one verified private transfer archive is retained.')
 
 
 def install():
+    operation = globals().get('INSTALL_OPERATION', 'export')
+    if operation not in ('export', 'finish'):
+        raise RuntimeError('Unknown export installation operation.')
     for tool in ('docker', 'rsync', 'zstd', 'tar', 'findmnt', 'sha256sum'):
         if not shutil.which(tool):
             raise RuntimeError('Required export tool is unavailable: ' + tool)
@@ -389,7 +470,7 @@ Requires=docker.service nas-plex-npm-export-resume.service
 After=docker.service nas-plex-npm-export-resume.service
 [Service]
 Type=oneshot
-ExecStart={WORKER} export
+ExecStart={WORKER} {operation}
 ExecStopPost={WORKER} resume
 TimeoutStartSec=4h
 TimeoutStopSec=10min
@@ -402,7 +483,10 @@ UMask=0077
     run('systemctl', 'daemon-reload')
     run('systemctl', 'enable', '--now', 'nas-plex-npm-export-resume.service')
     run('systemctl', 'start', '--no-block', 'nas-plex-npm-export.service')
-    say('Plex/NPM export started in the background. Source apps resume before compression and transfer.')
+    if operation == 'finish':
+        say('Retrying verification/compression of the saved snapshot in the background. Production apps stay running.')
+    else:
+        say('Plex/NPM export started in the background. Source apps resume before compression and transfer.')
     say('Watch: sudo journalctl -u nas-plex-npm-export.service -f')
     say('Ctrl+C leaves the log viewer; the export continues.')
 
@@ -420,11 +504,11 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX)
         if mode == 'resume':
             resume()
-        elif mode == 'export':
+        elif mode in ('export', 'finish'):
             def interrupted(signum, frame):
                 raise RuntimeError('Export interrupted; source recovery will run.')
             signal.signal(signal.SIGTERM, interrupted)
-            export()
+            export(reuse_only=(mode == 'finish'))
         else:
             raise RuntimeError('Unknown export operation.')
 
