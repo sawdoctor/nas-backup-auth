@@ -24,6 +24,7 @@ import tempfile
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo
 
 SIGNATURE = 'Sawdoctor nightly migration standby snapshots v1'
 FORMAT = 'sawdoctor-migration-standby-v1'
@@ -243,6 +244,12 @@ def source_engine(catalog=None, roots=None):
         return {name: current[name] for name in engine.IMAGES}
     engine.inspect_targets = inspect
     if roots is not None:
+        original_run = engine.run
+        def guarded_run(*args, **kwargs):
+            if args[:2] == ('docker', 'stop') and not nighttime_pause_allowed():
+                raise RuntimeError('The UK overnight pause window has closed; source recovery will continue.')
+            return original_run(*args, **kwargs)
+        engine.run = guarded_run
         def sync(work, live=False):
             copy_roots(work, roots, live)
             if not live:
@@ -302,6 +309,12 @@ def source_resume():
     restore_aux()
 
 
+def nighttime_pause_allowed(now=None):
+    current = (now or dt.datetime.now(dt.timezone.utc)).astimezone(ZoneInfo('Europe/London'))
+    minute = current.hour * 60 + current.minute
+    return 30 <= minute < 150
+
+
 def wait_quiet():
     prefs = Path(ROOTS['plex-config']) / 'Library/Application Support/Plex Media Server/Preferences.xml'
     token = ET.parse(prefs).getroot().attrib.get('PlexOnlineToken')
@@ -311,6 +324,9 @@ def wait_quiet():
     deadline = time.monotonic() + 7200
     report = 0
     while True:
+        if not nighttime_pause_allowed():
+            log('The 00:30-02:30 UK pause window has closed; skipping this snapshot.')
+            return False
         request = urllib.request.Request('http://127.0.0.1:32400/status/sessions', headers={'X-Plex-Token': token})
         try:
             with opener.open(request, timeout=10) as response:
@@ -318,7 +334,7 @@ def wait_quiet():
         except Exception:
             raise RuntimeError('The local Plex session check failed; source applications were not paused.')
         if count == 0:
-            return
+            return True
         if count < 0 or time.monotonic() >= deadline:
             raise RuntimeError('Plex did not become idle within two hours; the previous standby snapshot was retained.')
         if time.monotonic() >= report:
@@ -373,6 +389,9 @@ def verify_databases(work, engine):
 
 def snapshot_source():
     source_resume()
+    if not nighttime_pause_allowed():
+        log('Source snapshot skipped outside 00:30-02:30 UK time. Existing apps and snapshots retained.')
+        return
     catalog = inspect_source(); roots = data_roots(catalog)
     if not all(row['State']['Running'] for name, row in catalog.items() if name not in LIVE_STATIC):
         raise RuntimeError('A source application is deliberately stopped; its state was retained for review.')
@@ -406,7 +425,8 @@ def snapshot_source():
         'imageArchivesIncluded': False}
     log('Pre-copying application state, Plex/NPM data, custom host files and library symlinks...')
     copy_roots(work, roots, live=True)
-    wait_quiet()
+    if not wait_quiet():
+        return
     archive_state = run('systemctl', 'show', '--no-pager', 'torbox-audiobook-archive.service', '-p', 'ActiveState', '--value').strip()
     if archive_state not in ('inactive', 'failed'):
         raise RuntimeError('The source audiobook archive job is busy; no source applications were paused.')
@@ -608,7 +628,7 @@ IOSchedulingClass=idle
 Description=Nightly private migration standby refresh ({role})
 [Timer]
 OnCalendar=*-*-* {'00:30:00' if source else '01:15:00'} Europe/London
-Persistent=true
+Persistent={'false' if source else 'true'}
 Unit=nas-migration-standby.service
 [Install]
 WantedBy=timers.target
@@ -635,6 +655,7 @@ WantedBy=multi-user.target
 
 
 def install(source):
+    initial_install = not (UNITS / 'nas-migration-standby.service').exists()
     helper=module(SOURCE_HELPER,SOURCE_SHA,'standby_install_source') if ROLE=='source' else module(NAS_HELPER,NAS_SHA,'standby_install_nas')
     for executable in ('rsync','zstd','tar','sha256sum','ssh'):
         if not shutil.which(executable):
@@ -661,9 +682,14 @@ def install(source):
     run('systemctl','daemon-reload')
     if ROLE=='source':run('systemctl','enable','--now','nas-migration-standby-resume.service')
     run('systemctl','enable','--now','nas-migration-standby.timer')
-    run('systemctl','start','--no-block','nas-migration-standby.service')
+    if initial_install:
+        run('systemctl','start','--no-block','nas-migration-standby.service')
     log('NIGHTLY STANDBY REFRESH INSTALLED ON '+('OPTIPLEX' if ROLE=='source' else 'NAS')+'.')
-    log('Source 00:30; NAS receiver 01:15 UK time. Initial refresh started in systemd; closing SSH is safe.')
+    log('Source 00:30; NAS receiver 01:15 UK time. Closing SSH is safe.')
+    if ROLE=='source':
+        log('New source pauses are allowed only between 00:30 and 02:30 UK time. Missed runs are skipped.')
+    if not initial_install:
+        log('Schedule updated. The current snapshot was not interrupted and no additional snapshot was started.')
     log('Watch: sudo journalctl -u nas-migration-standby.service -n 20 --no-pager -o cat')
 
 
