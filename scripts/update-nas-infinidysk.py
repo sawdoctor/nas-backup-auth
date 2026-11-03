@@ -20,7 +20,7 @@ LEGACY = SSD / 'compose/infinidysk-nas/compose.json'
 RECOVERY = SSD / 'compose/infinidysk-nas/recovery/before-latest'
 LOCK = Path('/run/lock/sawdoctor-nas-backup.lock')
 IMAGE = 'ghcr.io/infinidysk/infinidysk:latest'
-VERSION = '1.7.0'
+VERSION = '1.7.1'
 NAME = 'infinidysk-nas'
 SIGNATURE = 'Sawdoctor NAS InfiniDysk latest update v1'
 BINARY = '/usr/local/libexec/infinidysk-rclone'
@@ -220,7 +220,9 @@ def main():
     run('docker', 'pull', '--quiet', IMAGE, timeout=600)
     target = json.loads(run('docker', 'image', 'inspect', IMAGE))[0]
     if version(target) != VERSION:
-        raise RuntimeError('The latest image is no longer reviewed version ' + VERSION + '; the running NAS was retained.')
+        actual = version(target) or '<version not recorded>'
+        raise RuntimeError('The pulled latest image reports ' + repr(actual[:100]) +
+                           ', while this update reviewed ' + VERSION + '; the running NAS was retained.')
     say('Reviewed image ready: ' + VERSION + '. Waiting for the NAS backup lock...')
     with LOCK.open('a') as lock:
         while True:
