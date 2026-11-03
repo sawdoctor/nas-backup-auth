@@ -53,7 +53,8 @@ def database_report(path):
             for row in database.execute('SELECT ' + selected + ' FROM "' + table + '"' + where):
                 entry = dict(row)
                 if 'domain_names' in entry:
-                    names = json.loads(entry['domain_names']) if isinstance(entry['domain_names'], str) else entry['domain_names']
+                    raw = entry['domain_names']
+                    names = json.loads(raw) if isinstance(raw, str) and raw else (raw or [])
                     if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
                         raise RuntimeError('A stored domain-name list has an unexpected format.')
                     entry['domain_names'] = names
