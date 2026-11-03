@@ -84,6 +84,9 @@ VOLUMES = {'support.tracearr': ('tracearr_tracearr_backups', 'tracearr', '/data/
     'support.tracearr-redis': ('tracearr_tracearr_redis', 'tracearr-redis', '/data')}
 AUX_TIMERS = ('media-mount-guard.timer', 'media-mount-watch.timer', 'tmc-deadlock-watch.timer',
     'nzbdav-safe-restart.timer', 'torbox-audiobook-archive.timer', 'abs-user-provisioner.timer', 'plex-api-watch.timer')
+SOURCE_WEB_ADDRESSES = {'wizarr':'172.21.0.2', 'nzbdav':'172.21.0.3',
+    'kometa':'172.21.0.4', 'usenet-ultimate':'172.21.0.5', 'prowlarr':'172.21.0.6',
+    'npm-app-1':'172.21.0.7', 'shelfmark-ebooks':'172.21.0.8'}
 
 
 def log(value):
@@ -111,11 +114,15 @@ def write_json(path, data, owner=None):
     atomic(path, json.dumps(data, indent=2) + '\n', owner=owner)
 
 
-def run(*args, timeout=120, allowed=(0,), **kwargs):
-    result = subprocess.run(args, text=True, capture_output=True, timeout=timeout, **kwargs)
+def run(*args, timeout=120, allowed=(0,), error_log='private-error.log', **kwargs):
+    try:
+        result = subprocess.run(args, text=True, capture_output=True, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        if BASE and BASE.is_dir():atomic(BASE/error_log,'Command timed out: '+json.dumps(args)+'\n')
+        raise RuntimeError('A standby command timed out; private diagnostic output was retained.') from None
     if result.returncode not in allowed:
         if BASE and BASE.is_dir():
-            atomic(BASE / 'private-error.log', result.stdout + '\n' + result.stderr)
+            atomic(BASE / error_log, 'Command: '+json.dumps(args)+'\n'+result.stdout+'\n'+result.stderr)
         raise RuntimeError('A standby snapshot command failed; diagnostic output was saved privately.')
     return result.stdout
 
@@ -150,6 +157,85 @@ def inspect_source():
     if env.get('DATABASE_PROVIDER', '').lower() not in ('', 'sqlite'):
         raise RuntimeError('The source InfiniDysk database provider differs from the existing SQLite installation.')
     return found
+
+
+def validate_source_networks(catalog):
+    network_ids=set()
+    for name,address in SOURCE_WEB_ADDRESSES.items():
+        row=catalog[name]
+        settings=row['NetworkSettings']['Networks'].get('web-network',{})
+        if not row['State']['Running'] or settings.get('IPAddress')!=address or not settings.get('EndpointID'):
+            raise RuntimeError('The restored source web-network map changed; no source applications were paused: '+name)
+        network_ids.add(settings['NetworkID'])
+        if name not in LIVE_STATIC and (settings.get('IPAMConfig') or {}).get('IPv4Address')!=address:
+            raise RuntimeError('A source web-network address is no longer pinned; no source applications were paused: '+name)
+    if len(network_ids)!=1:raise RuntimeError('The restored source web-network identity differs.')
+    for name,row in catalog.items():
+        if name not in SOURCE_WEB_ADDRESSES and 'web-network' in row['NetworkSettings'].get('Networks',{}):
+            raise RuntimeError('An additional source web-network member needs review before snapshotting: '+name)
+
+
+def resume_source_clients(engine,catalog,backup_locked=False):
+    if not engine.STATE.exists():return
+    if not backup_locked:
+        with engine.BACKUP_LOCK.open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            return resume_source_clients(engine,catalog,backup_locked=True)
+    # The copy deadline must never interrupt recovery itself.
+    signal.alarm(0)
+    state=json.loads(engine.STATE.read_text())
+    members=state.get('containers',[])
+    names=[item['name'] for item in members]
+    if state.get('format')!=FORMAT or len(names)!=len(set(names)) or not set(names)<=set(engine.IMAGES):
+        raise RuntimeError('The saved source recovery scope differs; its state was retained.')
+    def priority(item):
+        name=item['name']
+        first={'tracearr-db':0,'tracearr-redis':1,'nzbdav':2,'plex':3}
+        if name in first:return first[name]
+        networks=catalog[name].get('NetworkSettings',{}).get('Networks',{})
+        fixed=any((settings.get('IPAMConfig') or {}).get(key) for settings in networks.values() for key in ('IPv4Address','IPv6Address'))
+        return 4 if fixed else 5
+    failures=[];engine._recovering=True
+    try:
+        for item in sorted(reversed(members),key=priority):
+            name=item['name']
+            try:
+                current=json.loads(engine.run('docker','inspect',name,timeout=15))[0]
+                if item['id']!=catalog[name]['Id'] or current['Id']!=item['id'] or current['Image']!=engine.IMAGES[name]:
+                    raise RuntimeError('A paused source container identity changed.')
+                if not current['State']['Running']:
+                    for network,settings in catalog[name].get('NetworkSettings',{}).get('Networks',{}).items():
+                        expected=settings.get('IPAMConfig') or {}
+                        live=current.get('NetworkSettings',{}).get('Networks',{}).get(network,{})
+                        for key in ('IPv4Address','IPv6Address'):
+                            if expected.get(key) and ((live.get('IPAMConfig') or {}).get(key)!=expected[key] or live.get('NetworkID')!=settings['NetworkID']):
+                                raise RuntimeError('A paused source container network configuration changed.')
+                    if name=='plex':engine.run(str(engine.SAFE_START),timeout=330)
+                    else:engine.run('docker','start',item['id'],timeout=45)
+                if not json.loads(engine.run('docker','inspect',item['id'],timeout=15))[0]['State']['Running']:
+                    raise RuntimeError('The source container did not remain running.')
+            except Exception as error:
+                failures.append(name)
+                log('Recovery pending: '+name+' ('+type(error).__name__+'); continuing with other source apps.')
+                continue
+            state['containers']=[entry for entry in state['containers'] if entry['name']!=name]
+            engine.record(state)
+            log('Restored: '+name)
+        # Copying has ended. Restore the original backup controls even when an
+        # unrelated application still needs a retry; retain only pending work.
+        if state.get('ownsMarker'):
+            engine.BACKUP_MARKER.unlink(missing_ok=True)
+            state['ownsMarker']=False;engine.record(state)
+        if state.get('restoreBackupTimer'):
+            try:engine.run('systemctl','start',engine.BACKUP_TIMER)
+            except Exception:failures.append(engine.BACKUP_TIMER)
+            else:
+                state['restoreBackupTimer']=False;engine.record(state)
+        if not state['containers'] and not state.get('ownsMarker') and not state.get('restoreBackupTimer'):
+            engine.STATE.unlink()
+        if failures:raise RuntimeError('Source recovery attempted every app; pending retries: '+', '.join(failures))
+    finally:
+        engine._recovering=False
 
 
 def data_roots(containers):
@@ -233,6 +319,7 @@ def source_engine(catalog=None, roots=None):
     if catalog is None:
         path = SOURCE_BASE / 'catalog.json'
         if not path.exists():
+            if engine.STATE.exists():raise RuntimeError('The pending source recovery catalogue is missing.')
             return engine
         catalog = json.loads(path.read_text())
     engine.IMAGES = {name: catalog[name]['Image'] for name in APP_NAMES if name not in LIVE_STATIC}
@@ -241,15 +328,18 @@ def source_engine(catalog=None, roots=None):
         for name, original in catalog.items():
             if current[name]['Id'] != original['Id'] or current[name]['Image'] != original['Image']:
                 raise RuntimeError('An OptiPlex container changed during standby capture.')
+        if all(current[name]['State']['Running'] for name in engine.IMAGES):validate_source_networks(current)
         return {name: current[name] for name in engine.IMAGES}
     engine.inspect_targets = inspect
+    engine._recovering=False
+    def guarded_run(*args, **kwargs):
+        if args[:2] == ('docker', 'stop') and not nighttime_pause_allowed():
+            raise RuntimeError('The UK overnight pause window has closed; source recovery will continue.')
+        return run(*args,timeout=kwargs.pop('timeout',600),
+            error_log='source-recovery-command-error.log' if engine._recovering else 'source-command-error.log',**kwargs)
+    engine.run = guarded_run
+    engine.resume=lambda backup_locked=False:resume_source_clients(engine,catalog,backup_locked)
     if roots is not None:
-        original_run = engine.run
-        def guarded_run(*args, **kwargs):
-            if args[:2] == ('docker', 'stop') and not nighttime_pause_allowed():
-                raise RuntimeError('The UK overnight pause window has closed; source recovery will continue.')
-            return original_run(*args, **kwargs)
-        engine.run = guarded_run
         def sync(work, live=False):
             copy_roots(work, roots, live)
             if not live:
@@ -300,13 +390,17 @@ def restore_aux():
     if not set(names) <= set(AUX_TIMERS):
         raise RuntimeError('The recorded source timer list differs from this snapshot job.')
     for name in names:
-        run('systemctl', 'start', name)
+        run('systemctl', 'start', name,error_log='source-recovery-command-error.log')
     path.unlink()
 
 
 def source_resume():
-    source_engine().resume()
-    restore_aux()
+    failures=[]
+    try:source_engine().resume()
+    except Exception as error:failures.append(str(error) if isinstance(error,RuntimeError) else type(error).__name__)
+    try:restore_aux()
+    except Exception as error:failures.append(str(error) if isinstance(error,RuntimeError) else type(error).__name__)
+    if failures:raise RuntimeError('; '.join(failures))
 
 
 def nighttime_pause_allowed(now=None):
@@ -393,6 +487,7 @@ def snapshot_source():
         log('Source snapshot skipped outside 00:30-02:30 UK time. Existing apps and snapshots retained.')
         return
     catalog = inspect_source(); roots = data_roots(catalog)
+    validate_source_networks(catalog)
     if not all(row['State']['Running'] for name, row in catalog.items() if name not in LIVE_STATIC):
         raise RuntimeError('A source application is deliberately stopped; its state was retained for review.')
     work = SOURCE_BASE / 'snapshot-work'
@@ -612,6 +707,7 @@ def unit_texts(role):
 Description=Refresh private migration standby snapshot ({role})
 Requires={dependencies}
 After=network-online.target {dependencies}
+{'OnFailure=nas-migration-standby-retry.service' if source else ''}
 RequiresMountsFor={'/mnt/media /mnt/usenet_scratch' if source else str(SSD)}
 [Service]
 Type=oneshot
@@ -634,6 +730,20 @@ Unit=nas-migration-standby.service
 WantedBy=timers.target
 '''}
     if source:
+        result['nas-migration-standby-retry.service']=f'''# {SIGNATURE}
+[Unit]
+Description=Retry pending OptiPlex application recovery after a failed snapshot
+Requires=docker.service
+After=docker.service network-online.target
+StartLimitIntervalSec=0
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart={WORKER} resume-source
+Restart=on-failure
+RestartSec=60s
+TimeoutStartSec=10min
+'''
         result['nas-migration-standby-resume.service']=f'''# {SIGNATURE}
 [Unit]
 Description=Restore OptiPlex apps interrupted by standby snapshot
@@ -662,7 +772,9 @@ def install(source):
             raise RuntimeError('A required existing standby tool is unavailable: '+executable)
     if ROLE=='source':
         helper.check_authorization()
-        data_roots(inspect_source())
+        current=inspect_source()
+        data_roots(current)
+        validate_source_networks(current)
         for path in (OUTPUT,):
             if path.is_symlink():
                 raise RuntimeError('An unexpected symbolic source output directory was retained.')
@@ -707,7 +819,12 @@ def main():
     arguments=sys.argv[1:]
     if arguments==['resume-source']:
         if ROLE!='source':raise RuntimeError('Source recovery is OptiPlex-only.')
-        source_resume(); return
+        with (BASE/'.run.lock').open('a') as lock:
+            try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                log('A source snapshot/recovery already owns its lock; no applications were changed.');return
+            source_resume()
+        return
     if arguments in (['snapshot'],['receive']):
         if arguments!=(['snapshot'] if source else ['receive']):raise RuntimeError('This standby operation belongs on the other host.')
         with (BASE/'.run.lock').open('a') as lock:
