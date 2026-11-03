@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restore two source Docker endpoints to their recorded pre-snapshot addresses."""
+"""Restore the recorded source web-network map, resolving address chains safely."""
 import fcntl
 import hashlib
 import ipaddress
@@ -22,6 +22,8 @@ KNOWN_WORKERS = {
 NETWORK = 'web-network'
 PAIRS = (('nzbdav', 'wizarr', '172.21.0.2'),
          ('usenet-ultimate', 'kometa', '172.21.0.4'))
+PEERS = ('nzbdav', 'usenet-ultimate', 'shelfmark-ebooks', 'prowlarr')
+NAMES = PEERS + ('wizarr', 'kometa', 'npm-app-1')
 
 
 def say(text):
@@ -67,41 +69,80 @@ def owners(network):
 def preflight(catalog,current,network):
     if network['Name'] != NETWORK or network.get('Driver') != 'bridge' or network.get('Scope') != 'local':
         raise RuntimeError('The reviewed local web-network differs.')
-    allocated=owners(network); plan=[]
+    allocated=owners(network); plan=[]; saved_addresses=set()
     ranges=[ipaddress.ip_network(item['Subnet']) for item in network['IPAM']['Config'] if item.get('Subnet')]
-    for holder,target,fixed in PAIRS:
-        for name in (holder,target):
-            if (catalog[name]['Id'] != current[name]['Id'] or catalog[name]['Image'] != current[name]['Image']):
-                raise RuntimeError('A recorded source container identity changed: '+name)
-        original=catalog[holder]['NetworkSettings']['Networks'][NETWORK]
-        connection=current[holder]['NetworkSettings']['Networks'][NETWORK]
-        target_connection=current[target]['NetworkSettings']['Networks'][NETWORK]
-        target_original=catalog[target]['NetworkSettings']['Networks'][NETWORK]
-        if any(item['NetworkID'] != network['Id'] for item in (original,connection,target_connection,target_original)):
+    reviewed_ids={current[name]['Id'] for name in NAMES}
+    if not set(allocated.values()) <= reviewed_ids:
+        raise RuntimeError('An unreviewed container is attached to web-network; no connections were changed.')
+    for name in NAMES:
+        if catalog[name]['Id'] != current[name]['Id'] or catalog[name]['Image'] != current[name]['Image']:
+            raise RuntimeError('A recorded source container identity changed: '+name)
+        original=catalog[name]['NetworkSettings']['Networks'][NETWORK]
+        connection=current[name]['NetworkSettings']['Networks'][NETWORK]
+        if any(item['NetworkID'] != network['Id'] for item in (original,connection)):
             raise RuntimeError('A recorded source Docker network identity changed.')
-        if ((target_connection.get('IPAMConfig') or {}).get('IPv4Address') != fixed
-            or (target_original.get('IPAMConfig') or {}).get('IPv4Address') != fixed):
-            raise RuntimeError('A fixed Wizarr/Kometa address differs from the recorded setup.')
         saved=str(ipaddress.ip_address(original['IPAddress']))
-        if saved in {'172.21.0.2','172.21.0.4'} or not any(ipaddress.ip_address(saved) in subnet for subnet in ranges):
-            raise RuntimeError('The saved source address needs review: '+holder)
-        if allocated.get(saved) not in (None,current[holder]['Id']):
-            raise RuntimeError('The saved '+holder+' address '+saved+' is currently occupied; no connections were changed.')
-        media=current[holder]['NetworkSettings']['Networks'].get('media-core',{})
-        if not current[holder]['State']['Running'] or not media.get('EndpointID') or not media.get('IPAddress'):
-            raise RuntimeError(holder+' must retain its active media-core connection.')
-        if connection.get('IPAddress') not in (fixed,saved) or not connection.get('EndpointID'):
-            raise RuntimeError('The live source web address differs from the two reviewed cases: '+holder)
+        if saved in saved_addresses or not any(ipaddress.ip_address(saved) in subnet for subnet in ranges):
+            raise RuntimeError('The saved source address map needs review: '+name)
+        saved_addresses.add(saved)
         for settings in (original,connection):
             if (settings.get('Links') or settings.get('DriverOpts') or settings.get('GlobalIPv6Address')
                 or (settings.get('IPAMConfig') or {}).get('LinkLocalIPs')
                 or (settings.get('IPAMConfig') or {}).get('IPv6Address')):
-                raise RuntimeError('Additional endpoint options require review; no connections were changed.')
-        if allocated.get(fixed) not in (None,current[holder]['Id'],current[target]['Id']):
-            raise RuntimeError('A different container holds the fixed address; no connections were changed.')
-        plan.append({'holder':holder,'target':target,'fixed':fixed,'saved':saved,
-                     'id':current[holder]['Id'],'before':connection,'original':original})
+                raise RuntimeError('Additional endpoint options require review for '+name+'; no connections were changed.')
+        if name=='npm-app-1':
+            if not current[name]['State']['Running'] or connection.get('IPAddress')!=saved:
+                raise RuntimeError('The live NPM endpoint differs; this repair will not move NPM.')
+            continue
+        if name in ('wizarr','kometa'):
+            fixed='172.21.0.2' if name=='wizarr' else '172.21.0.4'
+            if saved!=fixed or any((item.get('IPAMConfig') or {}).get('IPv4Address')!=fixed for item in (original,connection)):
+                raise RuntimeError('A fixed Wizarr/Kometa address differs from the recorded setup.')
+            if current[name]['State']['Running'] and connection.get('IPAddress')!=fixed:
+                raise RuntimeError('A running Wizarr/Kometa endpoint differs; no connections were changed.')
+            continue
+        media=current[name]['NetworkSettings']['Networks'].get('media-core',{})
+        if name in ('nzbdav','usenet-ultimate') and (not media.get('EndpointID') or not media.get('IPAddress')):
+            raise RuntimeError(name+' must retain its active media-core connection.')
+        if not current[name]['State']['Running'] or not connection.get('EndpointID') or not connection.get('IPAddress'):
+            raise RuntimeError('A reviewed source peer is not connected and running: '+name)
+        plan.append({'holder':name,'saved':saved,'id':current[name]['Id'],
+                     'before':connection,'original':original})
     return plan
+
+
+def plan_moves(entries,network):
+    """Plan address chains and cycles completely before changing any endpoint."""
+    allocated=owners(network).copy()
+    current={item['holder']:item['before']['IPAddress'] for item in entries}
+    pending={item['holder']:item for item in entries if current[item['holder']]!=item['saved']}
+    reserved=set(allocated)|{item['saved'] for item in entries}|{'172.21.0.2','172.21.0.4'}
+    for config in network['IPAM']['Config']:
+        reserved.update((config.get('AuxiliaryAddresses') or {}).values())
+        if config.get('Gateway'):reserved.add(config['Gateway'])
+    steps=[]
+    while pending:
+        ready=next((name for name,item in pending.items() if item['saved'] not in allocated),None)
+        if ready is None:
+            ready=next(iter(pending));destination=None
+            for config in network['IPAM']['Config']:
+                subnet=ipaddress.ip_network(config['Subnet'])
+                if subnet.version!=4:continue
+                for offset in range(1,min(1024,subnet.num_addresses-1)):
+                    candidate=str(subnet.broadcast_address-offset)
+                    if candidate not in reserved and candidate not in allocated:
+                        destination=candidate;break
+                if destination:break
+            if not destination:raise RuntimeError('No temporary address is available to resolve the recorded address cycle.')
+            reserved.add(destination)
+        else:
+            destination=pending[ready]['saved']
+        item=pending[ready];source=current[ready]
+        steps.append(dict(item,source=source,destination=destination))
+        allocated.pop(source);allocated[destination]=item['id'];current[ready]=destination
+        if destination==item['saved']:del pending[ready]
+        if len(steps)>2*len(entries):raise RuntimeError('The recorded address graph could not be resolved safely.')
+    return steps
 
 
 def connect(item,address,settings):
@@ -115,21 +156,23 @@ def connect(item,address,settings):
 def move(item):
     live=inspect(item['holder'])[item['holder']]
     connection=live['NetworkSettings']['Networks'].get(NETWORK,{})
-    if connection.get('IPAddress') == item['saved']:
-        say(item['holder']+': saved web address already restored.');return
+    if live['Id']!=item['id'] or not live['State']['Running'] or connection.get('IPAddress')!=item['source']:
+        raise RuntimeError('A planned source endpoint changed before its move.')
+    allocated=owners(json.loads(run('docker','network','inspect',NETWORK))[0])
+    if item['destination'] in allocated:raise RuntimeError('A planned destination became occupied; remaining connections were retained.')
     run('docker','network','disconnect',NETWORK,item['id'])
     try:
-        connect(item,item['saved'],item['original'])
+        connect(item,item['destination'],item['original'])
     except Exception:
-        # Wizarr/Kometa have not been started yet, so the old address is still free.
-        try:connect(item,item['before']['IPAddress'],item['before'])
+        try:connect(item,item['source'],connection)
         except Exception:say('Web endpoint rollback also failed for '+item['holder']+'; its media-core attachment was retained.')
         raise
     updated=inspect(item['holder'])[item['holder']]
-    if (not updated['State']['Running'] or updated['NetworkSettings']['Networks'][NETWORK]['IPAddress'] != item['saved']
-        or updated['NetworkSettings']['Networks']['media-core']['EndpointID'] != live['NetworkSettings']['Networks']['media-core']['EndpointID']):
+    others={name:settings.get('EndpointID') for name,settings in live['NetworkSettings']['Networks'].items() if name!=NETWORK}
+    if (not updated['State']['Running'] or updated['NetworkSettings']['Networks'][NETWORK]['IPAddress'] != item['destination']
+        or any(updated['NetworkSettings']['Networks'].get(name,{}).get('EndpointID')!=identity for name,identity in others.items())):
         raise RuntimeError('A source endpoint verification failed; the private recovery record was retained.')
-    say(item['holder']+': original web-network address restored to '+item['saved']+'.')
+    say(item['holder']+': web-network '+item['source']+' -> '+item['destination']+'.')
 
 
 def repair():
@@ -143,19 +186,28 @@ def repair():
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:raise RuntimeError('A source snapshot operation is still running.')
         catalog=json.loads((BASE/'catalog.json').read_text())
-        names=[name for holder,target,fixed in PAIRS for name in (holder,target)]
+        names=NAMES
         current=inspect(*names);network=json.loads(run('docker','network','inspect',NETWORK))[0]
+        for name in names:
+            original=catalog[name]['NetworkSettings']['Networks'][NETWORK].get('IPAddress')
+            live=current[name]['NetworkSettings']['Networks'][NETWORK].get('IPAddress') or 'disconnected'
+            say(name+': current '+live+', recorded '+str(original)+'.')
         plan=preflight(catalog,current,network)
+        steps=plan_moves(plan,network)
         plex_check()
         record=BASE/'web-network-recovery.json'
-        if not record.exists():atomic(record,json.dumps({'format':SIGNATURE,'plan':plan},indent=2)+'\n')
-        for item in plan:move(item)
+        if not record.exists():atomic(record,json.dumps({'format':SIGNATURE,'plan':plan,'steps':steps},indent=2)+'\n')
+        say('Restoring the saved source web-network map: '+str(len(steps))+' endpoint moves.')
+        for item in steps:move(item)
         failures=[]
         for holder,target,fixed in PAIRS:
             try:run('docker','start',current[target]['Id']);say(target+': started.')
             except RuntimeError:failures.append(target);say(target+': restart failed; continuing other recovery attempts.')
         if failures:raise RuntimeError('A targeted restart still needs review: '+', '.join(failures))
         updated=inspect(*names)
+        for item in plan:
+            if updated[item['holder']]['NetworkSettings']['Networks'][NETWORK]['IPAddress']!=item['saved']:
+                raise RuntimeError('An original peer address was not restored.')
         for holder,target,fixed in PAIRS:
             if not updated[target]['State']['Running'] or updated[target]['NetworkSettings']['Networks'][NETWORK]['IPAddress'] != fixed:
                 raise RuntimeError('A restored fixed address did not match its original owner.')
