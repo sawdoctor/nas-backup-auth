@@ -67,6 +67,7 @@ class SourceTests(unittest.TestCase):
         for name, value in [('run', self.command), ('unit_state', lambda name: copy.deepcopy(self.states.get(name, {'LoadState': 'not-found', 'ActiveState': 'inactive'}))),
                             ('check_cron', lambda: None), ('locks', lambda paths: contextlib.nullcontext()),
                             ('session_count', lambda config: 1), ('identity', lambda config: 'e' * 64),
+                            ('runtime_identity', lambda config: 'd' * 64),
                             ('wait_api', lambda config, expected: None),
                             ('port_open', lambda host: self.row['State']['Running'] if host == '127.0.0.1' else False),
                             ('say', lambda text: self.actions.append(('log', text)))]:
@@ -171,6 +172,27 @@ class SourceTests(unittest.TestCase):
         result = subprocess.run(['bash', str(self.helper)], check=True, capture_output=True, text=True)
         self.assertNotIn('original', result.stdout)
 
+    def test_source_checker_can_be_updated_while_hold_and_originals_are_unchanged(self):
+        m.hold_source(daytime=True)
+        before_hold = m.HOLD.read_bytes(); before_guard = self.helper.read_bytes()
+        worker = self.root / 'trial-worker'; old = ('# ' + m.SIGNATURE + '\nold\n').encode(); worker.write_bytes(old)
+        new = ('# ' + m.SIGNATURE + '\nfixed identity check\n').encode()
+        with patch.object(m, 'WORKER', worker), patch.object(m, 'NAS_UPDATE_FROM', m.sha(old)):
+            m.install(new, 'source', 'update-held')
+            self.assertEqual(worker.read_bytes(), new)
+        self.assertFalse(self.row['State']['Running'])
+        self.assertEqual(m.HOLD.read_bytes(), before_hold)
+        self.assertEqual(self.helper.read_bytes(), before_guard)
+        self.assertEqual([a for a in self.actions if a[:2] == ('docker', 'stop')], [('docker', 'stop', '--time', '40', 'f' * 64)])
+
+    def test_source_checker_update_refuses_a_running_source(self):
+        m.hold_source(daytime=True)
+        self.row['State'].update(Running=True, Status='running')
+        worker = self.root / 'trial-worker'; old = ('# ' + m.SIGNATURE + '\nold\n').encode(); worker.write_bytes(old)
+        with patch.object(m, 'WORKER', worker), patch.object(m, 'NAS_UPDATE_FROM', m.sha(old)), self.assertRaises(RuntimeError):
+            m.install(b'new', 'source', 'update-held')
+        self.assertEqual(worker.read_bytes(), old)
+
 
 class NasStopTests(unittest.TestCase):
     def setUp(self):
@@ -238,8 +260,29 @@ class PathsAndIdentityTests(unittest.TestCase):
 
     def test_wait_api_rejects_other_machine_identity(self):
         import xml.etree.ElementTree as ET
-        with patch.object(m, 'api', return_value=ET.fromstring('<MediaContainer machineIdentifier="wrong" version="1.43.5.11079"/>')):
-            with self.assertRaises(RuntimeError): m.wait_api(Path('/unused'), 'e' * 64)
+        with patch.object(m, 'preferences', return_value=ET.fromstring('<Preferences MachineIdentifier="raw-id" ProcessedMachineIdentifier="dddddddddddddddddddddddddddddddddddddddd"/>')), \
+             patch.object(m, 'api', return_value=ET.fromstring('<MediaContainer machineIdentifier="wrong" version="1.43.5.11079"/>')):
+            with self.assertRaises(RuntimeError): m.wait_api(Path('/unused'), m.sha(b'raw-id'))
+
+    def test_api_identity_is_compared_to_processed_identifier_with_raw_identity_retained(self):
+        import xml.etree.ElementTree as ET
+        raw = '11111111-2222-3333-4444-555555555555'; processed = 'd' * 40
+        prefs = ET.fromstring('<Preferences MachineIdentifier="' + raw + '" ProcessedMachineIdentifier="' + processed + '"/>')
+        response = ET.fromstring('<MediaContainer machineIdentifier="' + processed + '" version="1.43.5.11079-b3b13e506"/>')
+        with patch.object(m, 'preferences', return_value=prefs), patch.object(m, 'api', return_value=response):
+            m.wait_api(Path('/unused'), m.sha(raw.encode()))
+        response.set('machineIdentifier', raw)
+        with patch.object(m, 'preferences', return_value=prefs), patch.object(m, 'api', return_value=response), self.assertRaises(RuntimeError):
+            m.wait_api(Path('/unused'), m.sha(raw.encode()))
+
+    def test_changed_saved_identifiers_are_rejected_during_startup(self):
+        import xml.etree.ElementTree as ET
+        raw = 'raw-id'; processed = 'd' * 40
+        original = ET.fromstring('<Preferences MachineIdentifier="raw-id" ProcessedMachineIdentifier="' + processed + '"/>')
+        changed = ET.fromstring('<Preferences MachineIdentifier="changed" ProcessedMachineIdentifier="' + processed + '"/>')
+        response = ET.fromstring('<MediaContainer machineIdentifier="' + processed + '" version="1.43.5.11079"/>')
+        with patch.object(m, 'preferences', side_effect=[original, original, changed]), patch.object(m, 'api', return_value=response), self.assertRaises(RuntimeError):
+            m.wait_api(Path('/unused'), m.sha(raw.encode()))
 
     def test_receiver_reader_adds_only_fixed_read_route_and_preserves_original(self):
         original = b'#!/bin/sh\n# existing\ncase "${SSH_ORIGINAL_COMMAND-}" in\nold) echo old ;;\nesac\n'
@@ -257,10 +300,10 @@ class NasStartTests(unittest.TestCase):
         self.nas.mkdir(parents=True); self.data = self.ssd / 'appdata/plex-nas'
         self.library = self.ssd / 'appdata/infinidysk-nas/library'; self.scratch = self.root / 'scratch'
         self.prefs = self.data / 'config' / m.PREFS; self.prefs.parent.mkdir(parents=True)
-        self.prefs.write_text('<Preferences MachineIdentifier="original-machine" PlexOnlineToken="synthetic-token" autoEmptyTrash="1" OtherSetting="preserved"/>')
+        self.prefs.write_text('<Preferences MachineIdentifier="original-machine" ProcessedMachineIdentifier="dddddddddddddddddddddddddddddddddddddddd" AnonymousMachineIdentifier="synthetic-anonymous" PlexOnlineToken="synthetic-token" autoEmptyTrash="1" OtherSetting="preserved"/>')
         self.before = self.prefs.read_bytes()
         self.held = {'format': m.SIGNATURE, 'held': True, 'trialId': 'a' * 32, 'receiptKey': 'b' * 64,
-                     'identitySha256': m.sha(b'original-machine')}
+                     'identitySha256': m.sha(b'original-machine'), 'apiIdentitySha256': m.sha(b'd' * 40)}
         self.mounts = {'/mnt/nzbdav': {'type': 'fuse.rclone', 'device': '0:101', 'root': '/'},
                        '/mnt/torbox-media': {'type': 'fuse.main.py', 'device': '0:102', 'root': '/'}}
         self.row = {'Id': 'c' * 64, 'Image': 'nas-image', 'Name': '/plex-nas',
@@ -304,6 +347,20 @@ class NasStartTests(unittest.TestCase):
         if args[:2] == ('docker', 'stop'): self.row['State'].update(Running=False, Status='exited')
         return ''
 
+    def stopped_trial(self):
+        import xml.etree.ElementTree as ET
+        before = self.nas / 'Preferences.before.xml'; before.write_bytes(self.before)
+        root = ET.fromstring(self.before)
+        for key, value in m.SAFE_PREFS.items(): root.set(key, value)
+        root.set('RuntimeSettingAddedByPlex', 'retain-this')
+        self.prefs.write_bytes(ET.tostring(root))
+        self.row['State'].update(Running=False, Status='exited', StartedAt='2026-11-04T23:00:00Z')
+        state = {'format': m.SIGNATURE, 'phase': 'stopped', 'trialId': self.held['trialId'],
+                 'receiptKey': self.held['receiptKey'], 'identitySha256': self.held['identitySha256'],
+                 'containerId': self.row['Id'], 'preferencesBeforeSha256': m.file_sha(before)}
+        m.write_json(m.NAS_STATE, state)
+        return state
+
     def test_verified_nas_start_changes_only_scan_safety_preferences_and_same_container(self):
         m.start_nas()
         self.assertTrue(self.row['State']['Running'])
@@ -338,6 +395,37 @@ class NasStartTests(unittest.TestCase):
         self.held['identitySha256'] = m.sha(b'original-machine')
         self.row['State']['StartedAt'] = '2026-11-04T20:00:00Z'
         with self.assertRaises(RuntimeError): m.start_nas()
+        self.assertFalse(self.row['State']['Running'])
+
+    def test_stopped_retry_retains_original_copy_and_runtime_preferences(self):
+        self.stopped_trial()
+        m.start_nas()
+        self.assertTrue(self.row['State']['Running'])
+        self.assertEqual(m.read_json(m.NAS_STATE)['phase'], 'active')
+        self.assertEqual((self.nas / 'Preferences.before.xml').read_bytes(), self.before)
+        self.assertEqual(m.preferences(self.data / 'config').get('RuntimeSettingAddedByPlex'), 'retain-this')
+
+    def test_stopped_retry_refuses_changed_ids_token_or_trial(self):
+        import xml.etree.ElementTree as ET
+        for key in ('MachineIdentifier', 'ProcessedMachineIdentifier', 'AnonymousMachineIdentifier', 'PlexOnlineToken'):
+            self.stopped_trial(); root = ET.parse(self.prefs).getroot(); root.set(key, 'e' * 40)
+            self.prefs.write_bytes(ET.tostring(root))
+            with self.subTest(key=key), self.assertRaises(RuntimeError): m.start_nas()
+            self.assertFalse(self.row['State']['Running'])
+        state = self.stopped_trial(); state['trialId'] = 'another-trial'; m.write_json(m.NAS_STATE, state)
+        with self.assertRaises(RuntimeError): m.start_nas()
+        self.assertFalse(self.row['State']['Running'])
+
+    def test_reviewed_stopped_nas_helper_can_be_updated_without_starting_it_in_installer(self):
+        self.stopped_trial(); before_state = m.NAS_STATE.read_bytes(); before_prefs = self.prefs.read_bytes()
+        worker = self.root / 'trial-worker'; old = ('# ' + m.SIGNATURE + '\nreviewed old helper\n').encode(); worker.write_bytes(old)
+        new = ('# ' + m.SIGNATURE + '\ncorrected helper\n').encode()
+        with patch.object(m, 'WORKER', worker), patch.object(m, 'NAS_IDENTITY_UPDATE_FROM', m.sha(old)), \
+             patch.object(m, 'unit_state', return_value={'ActiveState': 'inactive'}):
+            m.install(new, 'nas')
+        self.assertEqual(worker.read_bytes(), new)
+        self.assertEqual(m.NAS_STATE.read_bytes(), before_state)
+        self.assertEqual(self.prefs.read_bytes(), before_prefs)
         self.assertFalse(self.row['State']['Running'])
 
 
