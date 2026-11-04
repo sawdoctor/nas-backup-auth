@@ -33,9 +33,9 @@ UNITS = ('plex-daily-backup.timer', 'plex-daily-backup.service',
          'nas-migration-standby-retry.service')
 
 
-def run(*args):
+def run(*args, allowed=(0,)):
     result = subprocess.run(args, text=True, capture_output=True, timeout=20)
-    if result.returncode:
+    if result.returncode not in allowed:
         raise RuntimeError('A read-only source status check failed; command details were not displayed.')
     return result.stdout
 
@@ -66,7 +66,7 @@ def main():
         raise RuntimeError('The source Plex configuration path differs; it was retained.')
     try: count = sessions(config)
     except (OSError, ValueError, ET.ParseError): count = None
-    print('SOURCE PLEX: ' + json.dumps({'state': row['State']['Status'], 'image': row['Config']['Image'],
+    print('SOURCE PLEX: ' + json.dumps({'state': row['State']['Status'], 'image': row['Config']['Image'], 'imageId': row['Image'],
         'network': row['HostConfig']['NetworkMode'], 'restart': row['HostConfig']['RestartPolicy']['Name'],
         'activeSessions': count}, sort_keys=True), flush=True)
     changed = []
@@ -77,7 +77,7 @@ def main():
         if actual != expected: changed.append(name)
         print('SOURCE HELPER: ' + name + ' | ' + status, flush=True)
     output = run('systemctl', 'show', '--no-pager', '-p', 'Id', '-p', 'LoadState', '-p', 'ActiveState',
-                 '-p', 'SubState', '-p', 'MainPID', '-p', 'UnitFileState', *UNITS)
+                 '-p', 'SubState', '-p', 'MainPID', '-p', 'UnitFileState', *UNITS, allowed=(0, 1, 4))
     for group in output.strip().split('\n\n'):
         value = dict(line.split('=', 1) for line in group.splitlines() if '=' in line)
         if value.get('Id'): print('SOURCE UNIT: ' + json.dumps(value, sort_keys=True), flush=True)
