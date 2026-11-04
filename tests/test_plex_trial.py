@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -287,6 +288,7 @@ class NasStartTests(unittest.TestCase):
                             ('inspect', lambda name: copy.deepcopy(self.row)), ('port_open', lambda host: False),
                             ('locks', lambda paths: contextlib.nullcontext()), ('mount_table', lambda *args: self.mounts),
                             ('bind_check', lambda row, mounts: None), ('wait_api', lambda config, expected: None),
+                            ('media_recovery_check_locked', lambda: self.actions.append(('recovery-check-under-parent-lock',))),
                             ('say', lambda message: self.actions.append(('log', message)))]:
             p = patch.object(m, name, value); p.start(); self.addCleanup(p.stop)
         for target, value in [('is_mount', lambda self: True)]:
@@ -311,6 +313,8 @@ class NasStartTests(unittest.TestCase):
         for key, value in m.SAFE_PREFS.items(): self.assertEqual(m.preferences(self.data / 'config').get(key), value)
         self.assertIn(('docker', 'start', 'c' * 64), self.actions)
         self.assertFalse(any(a[:2] == ('docker', 'stop') for a in self.actions))
+        self.assertIn(('recovery-check-under-parent-lock',), self.actions)
+        self.assertFalse(any(a and a[0] == '/usr/local/sbin/nas-media-recovery' for a in self.actions))
 
     def test_nas_cannot_start_without_source_attestation_or_missing_source_link(self):
         with patch.object(m, 'source_remote', side_effect=RuntimeError('source not held')), self.assertRaises(RuntimeError):
@@ -335,6 +339,79 @@ class NasStartTests(unittest.TestCase):
         self.row['State']['StartedAt'] = '2026-11-04T20:00:00Z'
         with self.assertRaises(RuntimeError): m.start_nas()
         self.assertFalse(self.row['State']['Running'])
+
+
+class RecoveryLockRegressionTests(unittest.TestCase):
+    def test_reviewed_read_only_queries_work_while_parent_lock_is_held(self):
+        # Use the actual installed recovery implementation, including its real
+        # lock helper, rather than a CLI mock that conceals nested lock waits.
+        path = Path(__file__).resolve().parents[1] / 'scripts/install-nas-media-recovery.py'
+        spec = importlib.util.spec_from_file_location('trial_recovery_regression', path)
+        recovery = importlib.util.module_from_spec(spec); spec.loader.exec_module(recovery)
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / 'backup.lock'
+            with patch.object(recovery, 'LOCK', lock), patch.object(recovery, 'containers', return_value=[]), \
+                 patch.object(recovery, 'host_mounts', return_value={}), patch.object(recovery, 'saved_ids', return_value=[]), \
+                 patch.object(m, 'recovery_helper', return_value=recovery), patch.object(m, 'say'):
+                with m.locks([lock]):
+                    with recovery.locked(nonblocking=True) as acquired:
+                        self.assertFalse(acquired)
+                    m.media_recovery_check_locked()
+
+    def test_stale_mount_and_pending_backup_records_still_block_start(self):
+        item = {'Name': '/media-client', 'State': {'Running': True}}
+        recovery = types.SimpleNamespace(host_mounts=lambda: {}, containers=lambda: [item],
+                dependencies=lambda item: {'mount'}, ready=lambda *args: False,
+                stale_bindings=lambda *args: True, saved_ids=lambda: [])
+        with patch.object(m, 'recovery_helper', return_value=recovery), patch.object(m, 'say'), self.assertRaises(RuntimeError):
+            m.media_recovery_check_locked()
+        recovery.containers = lambda: []
+        recovery.saved_ids = lambda: ['pending']
+        with patch.object(m, 'recovery_helper', return_value=recovery), patch.object(m, 'say'), self.assertRaises(RuntimeError):
+            m.media_recovery_check_locked()
+
+    def test_timeout_errors_name_the_operation_without_command_output_or_secrets(self):
+        with patch.object(m.subprocess, 'run', side_effect=subprocess.TimeoutExpired(['ssh', 'private'], 20, output='secret')):
+            with self.assertRaisesRegex(RuntimeError, '^OptiPlex hold verification timed out after 20 seconds.$'):
+                m.run('ssh', 'private', timeout=20)
+
+
+class NasRetryInstallerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name); self.worker = self.root / 'worker'; self.nas = self.root / 'nas'; self.nas.mkdir()
+        self.old = ('# ' + m.SIGNATURE + '\nold reviewed helper\n').encode(); self.worker.write_bytes(self.old)
+        self.new = ('# ' + m.SIGNATURE + '\ncorrected helper\n').encode()
+        self.actions = []
+        self.row = {'State': {'Running': False, 'Status': 'created', 'StartedAt': '0001-01-01'},
+                    'Config': {'Image': m.IMAGE}, 'HostConfig': {'RestartPolicy': {'Name': 'no'}}}
+        for name, value in [('NAS', self.nas), ('NAS_STATE', self.nas / 'state.json'), ('WORKER', self.worker),
+                            ('NAS_UPDATE_FROM', m.sha(self.old)), ('SOURCE', self.root / 'source'),
+                            ('unit_state', lambda name: {'ActiveState': 'inactive'}),
+                            ('inspect', lambda name: self.row), ('locks', lambda paths: contextlib.nullcontext()),
+                            ('run', lambda *args, **kwargs: self.actions.append(args) or ''), ('say', lambda text: None)]:
+            p = patch.object(m, name, value); p.start(); self.addCleanup(p.stop)
+
+    def test_only_reviewed_nas_preflight_can_be_updated_and_retried(self):
+        m.install(self.new, 'nas')
+        self.assertEqual(self.worker.read_bytes(), self.new)
+        self.assertFalse(m.SOURCE.exists())
+        self.assertTrue(any(a[0] == 'systemd-run' and 'nas-start' in a for a in self.actions))
+
+    def test_source_unknown_helper_or_progressed_nas_cannot_be_overwritten(self):
+        with self.assertRaises(RuntimeError): m.install(self.new, 'source')
+        self.assertEqual(self.worker.read_bytes(), self.old)
+        with patch.object(m, 'NAS_UPDATE_FROM', 'unreviewed'), self.assertRaises(RuntimeError): m.install(self.new, 'nas')
+        self.assertEqual(self.worker.read_bytes(), self.old)
+        m.NAS_STATE.write_text('{}')
+        with self.assertRaises(RuntimeError): m.install(self.new, 'nas')
+        self.assertEqual(self.worker.read_bytes(), self.old)
+        self.assertFalse(any(a[0] == 'systemd-run' for a in self.actions))
+
+    def test_an_active_trial_operation_is_retained_without_replacing_its_helper(self):
+        with patch.object(m, 'unit_state', return_value={'ActiveState': 'activating'}): m.install(self.new, 'nas')
+        self.assertEqual(self.worker.read_bytes(), self.old)
+        self.assertFalse(self.actions)
 
 
 if __name__ == '__main__': unittest.main()
