@@ -205,6 +205,17 @@ class NasStopTests(unittest.TestCase):
         with self.assertRaises(RuntimeError): m.stop_nas()
         self.assertFalse(any(t.startswith('sudo ') for t in self.messages))
 
+    def test_safe_return_even_when_nas_preflight_failed_before_creating_record(self):
+        m.NAS_STATE.unlink()
+        self.row['State']['Running'] = False
+        self.row['Config'] = {'Image': m.IMAGE}
+        held = dict(self.state, held=True, identitySha256='e' * 64)
+        with patch.object(m, 'source_remote', return_value=held), patch.object(m, 'identity', return_value='e' * 64):
+            m.stop_nas()
+        token = next(t for t in self.messages if t.startswith('sudo ')).split()[-1]
+        m.verify_receipt(token, self.state)
+        self.assertEqual(self.stops, 0)
+
 
 class PathsAndIdentityTests(unittest.TestCase):
     def test_library_walker_does_not_follow_broken_streaming_symlinks(self):
