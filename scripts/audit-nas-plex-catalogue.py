@@ -17,20 +17,28 @@ SNAPSHOTS = SSD / 'migration/nightly-standby/snapshots'
 EXTENSIONS = {'.mkv', '.mp4', '.avi', '.m4v', '.ts', '.strm', '.mov'}
 
 
-def paths(root):
+def local_videos(root, categories=None):
     result = {}
-    for category in ('movies', 'movies-4k', 'tv'):
-        folder = root / category
+    pending = [root / category for category in categories] if categories is not None else [root]
+    while pending:
+        folder = pending.pop()
         if folder.is_symlink():
             raise RuntimeError('An unexpected symbolic library category was retained.')
-        for directory, folders, files in os.walk(folder, followlinks=False):
-            parent = Path(directory)
-            folders[:] = [name for name in folders if not (parent / name).is_symlink()]
-            for name in files:
-                path = parent / name
-                if path.suffix.lower() in EXTENSIONS:
-                    result[str(path.relative_to(root))] = os.readlink(path) if path.is_symlink() else None
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(path)
+                    elif path.suffix.lower() in EXTENSIONS:
+                        result[str(path.relative_to(root))] = os.readlink(path) if entry.is_symlink() else None
+        except FileNotFoundError:
+            continue
     return result
+
+
+def paths(root):
+    return local_videos(root, ('movies', 'movies-4k', 'tv'))
 
 
 def file_id(relative, target):
@@ -59,13 +67,14 @@ def records(database):
         if not {'Id', 'Type', 'FileSize', 'FileBlobId'} <= columns:
             raise RuntimeError('The InfiniDysk file-record schema needs review.')
         result = {}
-        for identifier, kind, size, blob in connection.execute('SELECT Id, Type, FileSize, FileBlobId FROM DavItems'):
+        extras = ',Path,HistoryItemId' if {'Path', 'HistoryItemId'} <= columns else ',NULL,NULL'
+        for identifier, kind, size, blob, folder, history in connection.execute('SELECT Id, Type, FileSize, FileBlobId' + extras + ' FROM DavItems'):
             try:
                 key = str(uuid.UUID(identifier))
                 blob = str(uuid.UUID(blob)) if blob is not None else None
             except (ValueError, TypeError, AttributeError):
                 raise RuntimeError('An InfiniDysk file identifier uses an unreviewed encoding.') from None
-            result[key] = {'type': kind, 'size': size, 'blob': blob}
+            result[key] = {'type': kind, 'size': size, 'blob': blob, 'path': folder, 'history': history}
         return result
     finally:
         connection.close()
@@ -132,8 +141,94 @@ def diagnose(source, nas, source_records, nas_records, source_config):
     return counts, findings
 
 
+def reference_id(relative, target, root, source, flora, seen=None):
+    if not isinstance(target, str): return None
+    path = Path(os.path.normpath(os.path.join(root, str(Path(relative).parent), target)))
+    seen = set() if seen is None else seen
+    if str(path) in seen or len(seen) > 16: return None
+    seen = seen | {str(path)}
+    if path.is_relative_to('/mnt/nzbdav/.ids'):
+        return file_id('file.mkv', str(path))
+    for prefix, mapping in (('/mnt/media', source), ('/flora-test-library', flora),
+                            ('/home/sawdoctor/plex2ultimate/flora-test-library', flora)):
+        if path.is_relative_to(prefix):
+            name = str(path.relative_to(prefix))
+            return reference_id(name, mapping.get(name), prefix, source, flora, seen)
+    return None
+
+
+def history_labels(database, records_needed):
+    connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5)
+    try:
+        connection.execute('PRAGMA query_only=ON')
+        deadline = time.monotonic() + 15
+        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+        wanted = {str(uuid.UUID(item['history'])) for item in records_needed if item.get('history')}
+        return {str(uuid.UUID(key)): {'category': category, 'job': job} for key, category, job in
+                connection.execute('SELECT Id,Category,JobName FROM HistoryItems') if str(uuid.UUID(key)) in wanted}
+    finally:
+        connection.close()
+
+
+def plex_sections(database, wanted):
+    connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5)
+    try:
+        connection.execute('PRAGMA query_only=ON')
+        deadline = time.monotonic() + 15
+        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+        sections = [{'name': name, 'root': root} for name, root in connection.execute(
+            'SELECT s.name,l.root_path FROM library_sections s LEFT JOIN section_locations l ON l.library_section_id=s.id ORDER BY s.id')]
+        labels = {}
+        for start in range(0, len(wanted), 100):
+            batch = wanted[start:start + 100]
+            for file, name in connection.execute(
+                    'SELECT p.file,s.name FROM media_parts p JOIN media_items m ON m.id=p.media_item_id '
+                    'JOIN metadata_items t ON t.id=m.metadata_item_id JOIN library_sections s ON s.id=t.library_section_id '
+                    'WHERE p.file COLLATE BINARY IN (' + ','.join('?' for _ in batch) + ')', batch):
+                labels.setdefault(file, []).append(name)
+        return sections, labels
+    finally:
+        connection.close()
+
+
+def provenance_report(snapshot, source, nas, original):
+    missing = sorted(source.keys() - nas.keys())
+    flora = local_videos(snapshot / 'data/flora-test-library')
+    flora_ids = {value for name, target in flora.items()
+                 if (value := reference_id(name, target, '/flora-test-library', source, flora)) is not None}
+    wanted = {name: file_id(name, source[name]) for name in missing}
+    histories = history_labels(snapshot / 'data/infinidysk-config/db.sqlite', [original.get(key, {}) for key in wanted.values()])
+    plex_database = snapshot / 'data/plex-config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db'
+    if plex_database.is_symlink() or not plex_database.is_file():
+        raise RuntimeError('The copied Plex database is unavailable for library identification.')
+    sections, plex_labels = plex_sections(plex_database, ['/mnt/media/' + name for name in missing])
+    print('COPIED PLEX LIBRARY SECTIONS: ' + json.dumps(sections, ensure_ascii=True), flush=True)
+    results = []; hints = 0; flora_matches = 0; categories = {}; dav_roots = {}
+    for name, key in wanted.items():
+        record = original.get(key, {})
+        history = histories.get(str(uuid.UUID(record['history'])), {}) if record.get('history') else {}
+        sections_for_file = sorted(set(plex_labels.get('/mnt/media/' + name, [])))
+        labels = [str(record.get('path') or ''), str(history.get('category') or '')] + sections_for_file
+        test_hint = any(re.search(r'(?i)(?:^|[\W_])(test(?:ing)?|flora|trial|poc|experiment)(?:$|[\W_])', label) for label in labels)
+        in_flora = key is not None and key in flora_ids
+        hints += int(test_hint); flora_matches += int(in_flora)
+        category = str(history.get('category') or '(unknown)')
+        categories[category] = categories.get(category, 0) + 1
+        root = str(Path(*Path(record['path']).parts[:3])) if record.get('path') else '(unknown)'
+        dav_roots[root] = dav_roots.get(root, 0) + 1
+        results.append({'libraryPath': name, 'sourceDavPath': record.get('path'),
+                        'sourceCategory': history.get('category'), 'sourceJob': history.get('job'),
+                        'plexSections': sections_for_file, 'referencedByFloraLinks': in_flora,
+                        'possibleTestLabel': test_hint})
+    print('READ-ONLY PROVENANCE SUMMARY: ' + json.dumps({'missingSourcePaths': len(missing),
+        'possibleTestLabels': hints, 'matchingFloraLinkTargets': flora_matches,
+        'floraVideoLinksInspected': len(flora), 'sourceCategories': categories, 'sourceDavRoots': dav_roots}, sort_keys=True), flush=True)
+    for result in results: print(json.dumps(result, ensure_ascii=True), flush=True)
+    print('Test labels and Flora references are clues only. No entries were restored, deleted or excluded.', flush=True)
+
+
 def main():
-    print('Checking local InfiniDysk file records; no streaming-mount probes or service changes...', flush=True)
+    print('Checking local InfiniDysk file records and library provenance; no streaming-mount probes or service changes...', flush=True)
     if os.geteuid() != 0 or 'inet 192.168.0.220/' not in subprocess.check_output(
             ['ip', '-4', 'addr', 'show'], text=True, timeout=10):
         raise RuntimeError('Run with sudo on the NAS at 192.168.0.220.')
@@ -164,8 +259,12 @@ def main():
         raise RuntimeError('The NAS InfiniDysk configuration binding differs.')
     source_config = snapshot / 'data/infinidysk-config'
     original = records(source_config / 'db.sqlite')
+    source_paths = paths(snapshot / 'data/library'); nas_paths = paths(LIBRARY)
+    if globals().get('REPORT_PROVENANCE'):
+        provenance_report(snapshot, source_paths, nas_paths, original)
+        return
     current = records(NAS_CONFIG / 'db.sqlite')
-    counts, findings = diagnose(paths(snapshot / 'data/library'), paths(LIBRARY), original, current, source_config)
+    counts, findings = diagnose(source_paths, nas_paths, original, current, source_config)
     print('READ-ONLY CATALOGUE COMPARISON: ' + json.dumps(counts, sort_keys=True), flush=True)
     for status, name in findings:
         print(status + ' | ' + name, flush=True)
