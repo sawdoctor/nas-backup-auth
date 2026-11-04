@@ -348,7 +348,9 @@ def prepare():
         # state and can change during an otherwise read-only catalogue query.
         for suffix in ('-wal',):
             relative = 'data/infinidysk-config/db.sqlite' + suffix
-            if (snapshot / relative).exists(): checked_source_file(snapshot, relative, checksums)
+            sidecar = snapshot / relative
+            if sidecar.exists() and sidecar.stat().st_size:
+                checked_source_file(snapshot, relative, checksums)
         source_paths = inventory(snapshot / 'data/library'); nas_paths = inventory(LIBRARY)
         if any(source_paths[name] != nas_paths[name] for name in source_paths.keys() & nas_paths.keys()):
             raise RuntimeError('An existing library path has different targets; it was retained.')
