@@ -6,6 +6,8 @@ import datetime as dt
 import fcntl
 import hashlib
 import hmac
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -40,6 +42,9 @@ PREFS = Path('Library/Application Support/Plex Media Server/Preferences.xml')
 SOURCE_CONFIG = Path('/home/sawdoctor/docker/plex/config')
 SOURCE_IMAGE = 'sha256:0c2f1122a4275efeea953a9882359f3809b27279d3c3022392e8e610a2eccc67'
 IMAGE = 'lscr.io/linuxserver/plex:1.43.5.11079-b3b13e506-ls331'
+RECOVERY_HELPER = Path('/usr/local/sbin/nas-media-recovery')
+RECOVERY_SHA = '618eb118dece842df2657b9f586fe64cebf1acbda5dc02361c01e99d9b575b2d'
+NAS_UPDATE_FROM = 'ce45f9921fcd307987354bc5e21695b05d65b42662b4e3b8b0741fa5c4c66767'
 HOST_KEY = '192.168.0.29 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGI1/hObYOUSPIqGKLePC0eEFvCc8Uoyv+YOmBbVPbgW\n'
 GUARD = ('\n# ' + SIGNATURE + '\n'
          'if [ -e ' + str(HOLD) + ' ]; then\n'
@@ -109,7 +114,12 @@ def read_json(path):
 
 
 def run(*args, timeout=30, allowed=(0,), private=None):
-    result = subprocess.run(args, text=True, capture_output=True, timeout=timeout)
+    label = {'ssh': 'OptiPlex hold verification', 'docker': 'Docker operation',
+             'systemctl': 'systemd operation'}.get(args[0], 'Trial command')
+    try:
+        result = subprocess.run(args, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(label + ' timed out after ' + str(timeout) + ' seconds.') from None
     if result.returncode not in allowed:
         if private is not None: atomic(private, (result.stdout + '\n' + result.stderr).encode())
         raise RuntimeError('A trial command failed; existing application data was retained.')
@@ -496,6 +506,33 @@ def bind_check(row, host):
             raise RuntimeError('NAS Plex received an old media mount; the trial will be stopped.')
 
 
+def recovery_helper():
+    if RECOVERY_HELPER.is_symlink() or not RECOVERY_HELPER.is_file() or file_sha(RECOVERY_HELPER) != RECOVERY_SHA:
+        raise RuntimeError('The installed NAS media recovery helper differs; it was retained.')
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader('plex_trial_media_recovery', str(RECOVERY_HELPER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    helper = importlib.util.module_from_spec(spec); loader.exec_module(helper)
+    helper.run = run
+    return helper
+
+
+def media_recovery_check_locked():
+    # The caller already owns the NAS backup lock. Calling the recovery CLI's
+    # check operation here would deadlock on its second flock/open. Reuse only
+    # the reviewed read-only queries while retaining the caller's lock.
+    helper = recovery_helper()
+    mounts = helper.host_mounts()
+    bad = [item['Name'].lstrip('/') for item in helper.containers()
+           if item['State']['Running'] and helper.dependencies(item)
+           and (not helper.ready(item, mounts) or helper.stale_bindings(item, mounts))]
+    pending = len(helper.saved_ids())
+    say('Media clients with unavailable/old mounts: ' + (', '.join(bad) or 'none'))
+    say('Pending backup recovery records: ' + str(pending))
+    if bad or pending:
+        raise RuntimeError('NAS media recovery still has pending clients; Plex was retained.')
+
+
 def start_nas():
     if NAS_STATE.exists():
         state = read_json(NAS_STATE)
@@ -504,12 +541,13 @@ def start_nas():
         raise RuntimeError('An existing NAS trial record was retained; use nas-stop before another trial.')
     if not SSD.is_mount() or not SCRATCH.is_mount(): raise RuntimeError('NAS appdata and scratch filesystems must be mounted.')
     with locks(['/run/lock/sawdoctor-nas-backup.lock', NAS / '.lock']):
+        say('Verifying the OptiPlex Plex hold through the existing restricted connection...')
         held = source_remote()
         if port_open('192.168.0.29') or port_open('127.0.0.1'): raise RuntimeError('A Plex port is already active; NAS Plex was retained.')
+        say('Checking the prepared NAS Plex image, identity, media bindings and library links...')
         row = inspect('plex-nas'); mounts = validate_nas(row, held)
-        recovery = run('/usr/local/sbin/nas-media-recovery', 'check', timeout=30)
-        if 'Media clients with unavailable/old mounts: none' not in recovery or 'Pending backup recovery records: 0' not in recovery:
-            raise RuntimeError('NAS media recovery still has pending clients; Plex was retained.')
+        say('Checking NAS mount recovery while retaining the existing backup lock...')
+        media_recovery_check_locked()
         prefs = DATA / 'config' / PREFS
         before = NAS / 'Preferences.before.xml'
         if before.exists(): raise RuntimeError('An earlier NAS trial preference copy was retained.')
@@ -612,13 +650,24 @@ def install(source, role):
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if WORKER.exists() and (WORKER.is_symlink() or SIGNATURE not in WORKER.read_text()):
         raise RuntimeError('An unrelated trial helper already exists; it was retained.')
-    if WORKER.exists() and sha(WORKER.read_bytes()) != sha(source):
-        raise RuntimeError('A different trial helper is installed; it was retained for review.')
-    atomic(WORKER, source, 0o700)
     unit = 'nas-plex-trial-hold' if role == 'source' else 'nas-plex-trial-start'
     state = unit_state(unit + '.service')
     if state.get('ActiveState') in ('active', 'activating', 'deactivating'):
         say('The Plex trial operation is already running.'); return
+    if WORKER.exists() and sha(WORKER.read_bytes()) != sha(source):
+        if role != 'nas' or file_sha(WORKER) != NAS_UPDATE_FROM:
+            raise RuntimeError('A different trial helper is installed; it was retained for review.')
+        with locks(['/run/lock/sawdoctor-nas-backup.lock', NAS / '.lock']):
+            row = inspect('plex-nas')
+            if (NAS_STATE.exists() or (NAS / 'Preferences.before.xml').exists()
+                or row['State']['Running'] or row['State']['Status'] != 'created'
+                or not row['State'].get('StartedAt', '').startswith('0001-')
+                or row['Config']['Image'] != IMAGE or row['HostConfig']['RestartPolicy']['Name'] != 'no'):
+                raise RuntimeError('The NAS trial has progressed beyond the reviewed failed preflight; current settings were retained.')
+            atomic(WORKER, source, 0o700)
+            say('Updated the reviewed NAS-only preflight helper. The OptiPlex hold is retained.')
+    else:
+        atomic(WORKER, source, 0o700)
     run('systemctl', 'reset-failed', unit + '.service', allowed=(0, 1, 4))
     args = ['systemd-run', '--unit=' + unit, '--collect', '--description=Guarded Plex migration trial (' + role + ')',
             '--property=TimeoutStartSec=10min', '--property=UMask=0077']
