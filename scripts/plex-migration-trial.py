@@ -567,7 +567,19 @@ def verify_receipt(token, state, now=None):
 
 def stop_nas():
     with locks(['/run/lock/sawdoctor-nas-backup.lock', NAS / '.lock']):
-        state = read_json(NAS_STATE)
+        if NAS_STATE.exists():
+            state = read_json(NAS_STATE)
+        else:
+            # A failed NAS preflight may not have made a local trial record.
+            # Keep the verified return path available without bypassing the
+            # source hold, matching identity or confirmed NAS stop.
+            held = source_remote(); candidate = inspect('plex-nas')
+            if (candidate['Config']['Image'] != IMAGE
+                or identity(DATA / 'config') != held['identitySha256']):
+                raise RuntimeError('The prepared NAS Plex identity differs; no source return receipt was issued.')
+            state = {'format': SIGNATURE, 'phase': 'preparing', 'trialId': held['trialId'],
+                     'receiptKey': held['receiptKey'], 'identitySha256': held['identitySha256'],
+                     'containerId': candidate['Id']}
         if state.get('format') != SIGNATURE: raise RuntimeError('An unrelated NAS trial record was retained.')
         row = inspect('plex-nas')
         if row['Id'] != state['containerId'] or row['HostConfig']['RestartPolicy']['Name'] != 'no':
