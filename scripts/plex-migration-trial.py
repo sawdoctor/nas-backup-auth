@@ -45,6 +45,7 @@ IMAGE = 'lscr.io/linuxserver/plex:1.43.5.11079-b3b13e506-ls331'
 RECOVERY_HELPER = Path('/usr/local/sbin/nas-media-recovery')
 RECOVERY_SHA = '618eb118dece842df2657b9f586fe64cebf1acbda5dc02361c01e99d9b575b2d'
 NAS_UPDATE_FROM = 'ce45f9921fcd307987354bc5e21695b05d65b42662b4e3b8b0741fa5c4c66767'
+NAS_IDENTITY_UPDATE_FROM = '3fd35c18ed10a0d441d1a1039d859eb357b1d67c60c6fdf619acfd378c761e57'
 HOST_KEY = '192.168.0.29 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGI1/hObYOUSPIqGKLePC0eEFvCc8Uoyv+YOmBbVPbgW\n'
 GUARD = ('\n# ' + SIGNATURE + '\n'
          'if [ -e ' + str(HOLD) + ' ]; then\n'
@@ -149,6 +150,13 @@ def preferences(config): return ET.parse(config / PREFS).getroot()
 def identity(config):
     value = preferences(config).get('MachineIdentifier')
     if not value: raise RuntimeError('The existing Plex server identity is missing.')
+    return sha(value.encode())
+
+
+def runtime_identity(config):
+    value = preferences(config).get('ProcessedMachineIdentifier', '')
+    if not re.fullmatch(r'[0-9a-fA-F]{40}', value):
+        raise RuntimeError('The existing processed Plex server identifier is missing or invalid.')
     return sha(value.encode())
 
 
@@ -274,8 +282,11 @@ def source_status():
             and guarded_files_ok(state) and not port_open('127.0.0.1'))
     if held:
         assert_idle()
+        if identity(SOURCE_CONFIG) != state['identitySha256']:
+            raise RuntimeError('The held source Plex preferences changed; NAS startup remains blocked.')
         return {'format': SIGNATURE, 'held': True, 'trialId': state['trialId'], 'receiptKey': state['receiptKey'],
-                'identitySha256': state['identitySha256'], 'containerId': row['Id']}
+                'identitySha256': state['identitySha256'], 'apiIdentitySha256': runtime_identity(SOURCE_CONFIG),
+                'containerId': row['Id']}
     return {'format': SIGNATURE, 'held': False}
 
 
@@ -422,6 +433,8 @@ def source_remote():
         raise RuntimeError('Source Plex is not verifiably held; NAS Plex remains stopped.')
     if not re.fullmatch(r'[0-9a-f]{64}', result.get('receiptKey', '')):
         raise RuntimeError('The source trial receipt key is invalid.')
+    if not re.fullmatch(r'[0-9a-f]{64}', result.get('apiIdentitySha256', '')):
+        raise RuntimeError('Update the held OptiPlex trial checker first; NAS Plex remains stopped.')
     return result
 
 
@@ -447,9 +460,10 @@ def mount_table(path=Path('/proc/self/mountinfo')):
     return result
 
 
-def validate_nas(row, held):
-    if (row['Name'] != '/plex-nas' or row['State']['Running'] or row['State']['Status'] != 'created'
-        or not row['State'].get('StartedAt', '').startswith('0001-') or row['Config']['Image'] != IMAGE
+def validate_nas(row, held, retry=False):
+    permitted_state = (row['State']['Status'] == 'exited' if retry else
+                       row['State']['Status'] == 'created' and row['State'].get('StartedAt', '').startswith('0001-'))
+    if (row['Name'] != '/plex-nas' or row['State']['Running'] or not permitted_state or row['Config']['Image'] != IMAGE
         or row['HostConfig']['RestartPolicy']['Name'] != 'no' or row['HostConfig']['NetworkMode'] != 'host'):
         raise RuntimeError('The never-started NAS Plex preparation differs; it was retained.')
     expected = {'/config': DATA / 'config', '/flora-test-library': DATA / 'flora-test-library', '/scratch': SCRATCH,
@@ -463,6 +477,8 @@ def validate_nas(row, held):
         raise RuntimeError('The NAS Plex image identity differs.')
     if identity(DATA / 'config') != held['identitySha256']:
         raise RuntimeError('The source and prepared NAS Plex identities differ.')
+    if runtime_identity(DATA / 'config') != held.get('apiIdentitySha256'):
+        raise RuntimeError('The source and NAS processed Plex identities differ; existing data was retained.')
     marker = read_json(DATA / '.standby-refreshed.json')
     if marker.get('format') != 'Sawdoctor NAS Plex standby refresh v1': raise RuntimeError('The NAS standby preparation marker differs.')
     stamp = marker['sourceCreatedUtc']
@@ -483,12 +499,17 @@ def validate_nas(row, held):
 
 
 def wait_api(config, expected_identity):
+    if identity(config) != expected_identity:
+        raise RuntimeError('The saved raw Plex server identifier differs.')
+    expected_api_identity = runtime_identity(config)
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         try:
             result = api('/identity', config)
-            if sha(result.get('machineIdentifier', '').encode()) != expected_identity:
-                raise RuntimeError('The running Plex server identity differs.')
+            if sha(result.get('machineIdentifier', '').encode()) != expected_api_identity:
+                raise RuntimeError('The reported Plex identifier differs from its saved processed identifier.')
+            if identity(config) != expected_identity or runtime_identity(config) != expected_api_identity:
+                raise RuntimeError('Saved Plex server identifiers changed during startup.')
             if not result.get('version', '').startswith('1.43.5.11079'):
                 raise RuntimeError('The running Plex version differs from the reviewed image.')
             return
@@ -533,33 +554,66 @@ def media_recovery_check_locked():
         raise RuntimeError('NAS media recovery still has pending clients; Plex was retained.')
 
 
+def validate_stopped_retry(state, row, held):
+    if (state.get('format') != SIGNATURE or state.get('phase') != 'stopped'
+        or state.get('containerId') != row['Id'] or state.get('trialId') != held['trialId']
+        or state.get('identitySha256') != held['identitySha256']):
+        raise RuntimeError('The stopped NAS trial record differs; existing data was retained.')
+    before = NAS / 'Preferences.before.xml'
+    if (before.is_symlink() or not before.is_file()
+        or file_sha(before) != state.get('preferencesBeforeSha256')):
+        raise RuntimeError('The original NAS trial preference copy differs; it was retained.')
+    original = ET.parse(before).getroot(); current = preferences(DATA / 'config')
+    for key in ('MachineIdentifier', 'ProcessedMachineIdentifier', 'AnonymousMachineIdentifier', 'PlexOnlineToken'):
+        if not original.get(key) or original.get(key) != current.get(key):
+            raise RuntimeError('A saved NAS Plex identifier or token changed; current settings were retained.')
+    if (sha(original.get('MachineIdentifier').encode()) != held['identitySha256']
+        or sha(original.get('ProcessedMachineIdentifier').encode()) != held.get('apiIdentitySha256')):
+        raise RuntimeError('The original NAS Plex identifiers do not match the held source.')
+    if any(current.get(key) != value for key, value in SAFE_PREFS.items()):
+        raise RuntimeError('NAS trial scan settings were edited; they were retained for review.')
+
+
 def start_nas():
+    retry_state = None
     if NAS_STATE.exists():
         state = read_json(NAS_STATE)
         if state.get('format') == SIGNATURE and state.get('phase') == 'active' and inspect('plex-nas')['State']['Running']:
             source_remote(); say('NAS PLEX TRIAL ACTIVE. Existing trial settings were retained.'); return
-        raise RuntimeError('An existing NAS trial record was retained; use nas-stop before another trial.')
+        if state.get('format') != SIGNATURE or state.get('phase') != 'stopped':
+            raise RuntimeError('An existing NAS trial record was retained; use nas-stop before another trial.')
+        retry_state = state
     if not SSD.is_mount() or not SCRATCH.is_mount(): raise RuntimeError('NAS appdata and scratch filesystems must be mounted.')
     with locks(['/run/lock/sawdoctor-nas-backup.lock', NAS / '.lock']):
         say('Verifying the OptiPlex Plex hold through the existing restricted connection...')
         held = source_remote()
         if port_open('192.168.0.29') or port_open('127.0.0.1'): raise RuntimeError('A Plex port is already active; NAS Plex was retained.')
         say('Checking the prepared NAS Plex image, identity, media bindings and library links...')
-        row = inspect('plex-nas'); mounts = validate_nas(row, held)
+        row = inspect('plex-nas'); mounts = validate_nas(row, held, retry=retry_state is not None)
+        if retry_state is not None:
+            if read_json(NAS_STATE) != retry_state: raise RuntimeError('The NAS trial record changed during retry.')
+            validate_stopped_retry(retry_state, row, held)
         say('Checking NAS mount recovery while retaining the existing backup lock...')
         media_recovery_check_locked()
         prefs = DATA / 'config' / PREFS
         before = NAS / 'Preferences.before.xml'
-        if before.exists(): raise RuntimeError('An earlier NAS trial preference copy was retained.')
-        shutil.copy2(prefs, before); info = prefs.stat(); os.chown(before, info.st_uid, info.st_gid)
-        state = {'format': SIGNATURE, 'phase': 'preparing', 'trialId': held['trialId'],
-                 'receiptKey': held['receiptKey'], 'identitySha256': held['identitySha256'],
-                 'containerId': row['Id'], 'preferencesBeforeSha256': file_sha(before),
-                 'createdUtc': dt.datetime.now(dt.timezone.utc).isoformat()}
-        write_json(NAS_STATE, state)
-        root = ET.fromstring(before.read_bytes())
-        for key, value in SAFE_PREFS.items(): root.set(key, value)
-        atomic(prefs, ET.tostring(root, encoding='utf-8', xml_declaration=True), reference=before)
+        if retry_state is None:
+            if before.exists(): raise RuntimeError('An earlier NAS trial preference copy was retained.')
+            shutil.copy2(prefs, before); info = prefs.stat(); os.chown(before, info.st_uid, info.st_gid)
+            state = {'format': SIGNATURE, 'phase': 'preparing', 'trialId': held['trialId'],
+                     'receiptKey': held['receiptKey'], 'identitySha256': held['identitySha256'],
+                     'apiIdentitySha256': held['apiIdentitySha256'],
+                     'containerId': row['Id'], 'preferencesBeforeSha256': file_sha(before),
+                     'createdUtc': dt.datetime.now(dt.timezone.utc).isoformat()}
+            write_json(NAS_STATE, state)
+            root = ET.fromstring(before.read_bytes())
+            for key, value in SAFE_PREFS.items(): root.set(key, value)
+            atomic(prefs, ET.tostring(root, encoding='utf-8', xml_declaration=True), reference=before)
+        else:
+            state = retry_state
+            state['phase'] = 'preparing'; state['apiIdentitySha256'] = held['apiIdentitySha256']
+            write_json(NAS_STATE, state)
+            say('Retaining the existing NAS Plex data, identifiers and original trial recovery copy for this retry.')
         try:
             # Recheck the remote hold immediately before the only start.
             if source_remote()['trialId'] != held['trialId']: raise RuntimeError('The source trial changed; NAS Plex stays stopped.')
@@ -644,7 +698,23 @@ def resume_source(token):
         restore_source(state, start=True)
 
 
-def install(source, role):
+def update_held_source(source):
+    if WORKER.is_symlink() or not WORKER.is_file() or file_sha(WORKER) not in (NAS_UPDATE_FROM, sha(source)):
+        raise RuntimeError('The held source trial checker differs; it was retained.')
+    if unit_state('nas-plex-trial-hold.service').get('ActiveState') in ('active', 'activating', 'deactivating'):
+        raise RuntimeError('The source hold operation is still running; its checker was retained.')
+    with locks([SOURCE / '.lock']):
+        if not source_status().get('held'):
+            raise RuntimeError('Source Plex is not in its verified stopped hold; its checker was retained.')
+        atomic(WORKER, source, 0o700)
+    say('SOURCE TRIAL CHECKER UPDATED. Plex remains held/stopped; source data and timer states are retained.')
+
+
+def install(source, role, operation='start'):
+    if operation == 'update-held':
+        if role != 'source': raise RuntimeError('The held-source checker update belongs on the OptiPlex.')
+        update_held_source(source); return
+    if operation != 'start': raise RuntimeError('Unknown trial installer operation.')
     root = SOURCE if role == 'source' else NAS
     if root.is_symlink(): raise RuntimeError('An unexpected symbolic trial directory was retained.')
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -655,15 +725,21 @@ def install(source, role):
     if state.get('ActiveState') in ('active', 'activating', 'deactivating'):
         say('The Plex trial operation is already running.'); return
     if WORKER.exists() and sha(WORKER.read_bytes()) != sha(source):
-        if role != 'nas' or file_sha(WORKER) != NAS_UPDATE_FROM:
+        old_sha = file_sha(WORKER)
+        if role != 'nas' or old_sha not in (NAS_UPDATE_FROM, NAS_IDENTITY_UPDATE_FROM):
             raise RuntimeError('A different trial helper is installed; it was retained for review.')
         with locks(['/run/lock/sawdoctor-nas-backup.lock', NAS / '.lock']):
             row = inspect('plex-nas')
-            if (NAS_STATE.exists() or (NAS / 'Preferences.before.xml').exists()
-                or row['State']['Running'] or row['State']['Status'] != 'created'
-                or not row['State'].get('StartedAt', '').startswith('0001-')
-                or row['Config']['Image'] != IMAGE or row['HostConfig']['RestartPolicy']['Name'] != 'no'):
+            if NAS_STATE.exists() and old_sha == NAS_IDENTITY_UPDATE_FROM:
+                held = source_remote()
+                validate_nas(row, held, retry=True)
+                validate_stopped_retry(read_json(NAS_STATE), row, held)
+            elif (NAS_STATE.exists() or (NAS / 'Preferences.before.xml').exists()
+                  or row['State']['Running'] or row['State']['Status'] != 'created'
+                  or not row['State'].get('StartedAt', '').startswith('0001-')):
                 raise RuntimeError('The NAS trial has progressed beyond the reviewed failed preflight; current settings were retained.')
+            if row['Config']['Image'] != IMAGE or row['HostConfig']['RestartPolicy']['Name'] != 'no':
+                raise RuntimeError('The NAS Plex image or restart policy changed; it was retained.')
             atomic(WORKER, source, 0o700)
             say('Updated the reviewed NAS-only preflight helper. The OptiPlex hold is retained.')
     else:
@@ -685,7 +761,7 @@ def main():
     if 'INSTALL_SOURCE' in globals():
         expected = globals().get('INSTALL_ROLE')
         if role != expected: raise RuntimeError('This installer belongs on the ' + str(expected) + ' host.')
-        install(globals()['INSTALL_SOURCE'].encode(), role); return
+        install(globals()['INSTALL_SOURCE'].encode(), role, globals().get('INSTALL_OPERATION', 'start')); return
     args = sys.argv[1:]
     if role == 'source':
         if args == ['source-status-private']: private_source_status(); return
