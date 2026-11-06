@@ -51,10 +51,15 @@ def quota_state(path):
                             env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'})
     pattern = r'(user|group) quota on ' + re.escape(path) + r' \(/dev/[^()\s]+\) is (on|off)'
     rows = [re.fullmatch(pattern, line) for line in result.stdout.splitlines()]
-    if (result.returncode or result.stderr.strip() or len(rows) != 2 or not all(rows)
+    if (result.stderr.strip() or len(rows) != 2 or not all(rows)
             or {row[1] for row in rows} != {'user', 'group'}):
         raise RuntimeError('The NAS user/group quota state could not be verified.')
-    return {row[1]: row[2] for row in rows}
+    state = {row[1]: row[2] for row in rows}
+    # quotaon -p returns the number of enabled quotas, not a success/failure code.
+    # Require that count to match both complete, validated state lines.
+    if result.returncode != sum(value == 'on' for value in state.values()):
+        raise RuntimeError('The NAS quota query exit status differs from its reported states.')
+    return state
 
 def main():
     if os.geteuid() != 0 or len(sys.argv) != 2:
