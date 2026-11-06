@@ -146,7 +146,7 @@ class InstallerTests(unittest.TestCase):
         if args[:2] == ('systemctl', 'show'):
             unit = args[3]
             dest = self.system / (unit + '.d') / s.DROPIN
-            return ('FragmentPath=' + str(self.base) + '\nDropInPaths=' + (str(dest) if dest.exists() else '')
+            return ('FragmentPath=' + str(self.base) + '\nDropInPaths=' + (json.dumps(str(dest)) if dest.exists() else '')
                     + '\nActiveState=' + ('inactive' if unit in self.started else 'failed') + '\n')
         if args[:2] == ('systemctl', 'start'):
             self.started.add(args[2])
@@ -154,6 +154,25 @@ class InstallerTests(unittest.TestCase):
         if args == ('systemctl', 'daemon-reload'):
             return ''
         raise AssertionError(args)
+
+    def test_exact_observed_quoted_systemctl_path_is_accepted(self):
+        destination = (r'/etc/systemd/system/quotaon@srv-dev\x2ddisk\x2dby\x2duuid'
+                       r'\x2de5af079d\x2d1bbd\x2d4ad2\x2da94b\x2d5a6dbaf8b4d6.service.d/'
+                       '50-nas-already-enabled.conf')
+        displayed = (r'"/etc/systemd/system/quotaon@srv-dev\\x2ddisk\\x2dby\\x2duuid'
+                     r'\\x2de5af079d\\x2d1bbd\\x2d4ad2\\x2da94b\\x2d5a6dbaf8b4d6.service.d/'
+                     '50-nas-already-enabled.conf"')
+        self.assertTrue(s.expected_dropin({'DropInPaths': displayed}, destination))
+        self.assertTrue(s.expected_dropin({'DropInPaths': destination}, destination))
+
+    def test_additional_missing_or_edited_loaded_overrides_are_rejected(self):
+        destination = r'/etc/systemd/system/quotaon@srv-dev\x2ddisk.service.d/50-nas-already-enabled.conf'
+        for value in (None, '', json.dumps(destination + '.edited'),
+                      json.dumps(destination) + ' ' + json.dumps('/another/override.conf'),
+                      destination + ' /another/override.conf'):
+            with self.subTest(value=value):
+                self.assertFalse(s.expected_dropin({'DropInPaths': value}, destination))
+        self.assertTrue(s.expected_dropin({'DropInPaths': ''}, destination, allow_absent=True))
 
     def test_installs_only_two_conditions_and_keeps_vendor_command(self):
         before = self.base.read_bytes()
