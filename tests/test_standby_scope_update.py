@@ -3,8 +3,10 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import tempfile
+import subprocess
 import types
 import unittest
 from unittest.mock import patch
@@ -106,6 +108,35 @@ class ScopeTests(unittest.TestCase):
             with stack,self.assertRaisesRegex(RuntimeError,'different previous-worker'):
                 s.install_locked('nas',base,before,after)
             self.assertEqual(worker.read_bytes(),before)
+
+    def test_collected_transient_installer_is_allowed_but_missing_main_service_is_rejected(self):
+        response=subprocess.CompletedProcess([],1,stdout='LoadState=not-found\nActiveState=inactive\n')
+        with patch.object(s.subprocess,'run',return_value=response):
+            s.inactive('nas-migration-standby-install.service')
+            with self.assertRaisesRegex(RuntimeError,'busy or unavailable'):
+                s.inactive('nas-migration-standby.service')
+
+    def test_busy_transient_installer_and_incomplete_service_status_are_rejected(self):
+        outputs=('LoadState=loaded\nActiveState=active\n',
+                 'LoadState=loaded\nActiveState=activating\n',
+                 'LoadState=loaded\nActiveState=deactivating\n',
+                 'ActiveState=inactive\n')
+        for output in outputs:
+            response=subprocess.CompletedProcess([],0,stdout=output)
+            with self.subTest(output=output),patch.object(s.subprocess,'run',return_value=response):
+                with self.assertRaisesRegex(RuntimeError,'busy or unavailable'):
+                    s.inactive('nas-migration-standby-install.service')
+
+    def test_already_patched_nas_without_receipt_gets_a_verification_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            before=self.original_fixture();after=s.nas_patch(before)
+            stack,worker,helper,base,calls=self.install_fixture(Path(directory),after)
+            with stack:s.install_locked('nas',base,after,after)
+            self.assertEqual(worker.read_bytes(),after)
+            record=json.loads((base/'scope-change/applied.json').read_text())
+            self.assertTrue(record['verifiedOnly'])
+            self.assertEqual(record['afterSha256'],s.sha(after))
+            self.assertNotIn('beforeSha256',record)
 
 
 if __name__=='__main__':unittest.main()
