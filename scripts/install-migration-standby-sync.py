@@ -28,6 +28,9 @@ from zoneinfo import ZoneInfo
 
 SIGNATURE = 'Sawdoctor nightly migration standby snapshots v1'
 FORMAT = 'sawdoctor-migration-standby-v1'
+NIGHTLY_PROFILE = 'apps-with-external-plex-v1'
+PLEX_BACKUP_HELPER = Path('/usr/local/bin/plex-daily-backup.sh')
+PLEX_BACKUP_SHA = '2b940406adc76ad6a316d5739f4f64c79c0f54cddc54083d4dae4dc27fdd9e66'
 WORKER = Path('/usr/local/sbin/nas-migration-standby')
 SSD = Path('/srv/dev-disk-by-uuid-e5af079d-1bbd-4ad2-a94b-5a6dbaf8b4d6')
 SOURCE_BASE = Path('/var/lib/sawdoctor-migration-standby')
@@ -239,7 +242,8 @@ def resume_source_clients(engine,catalog,backup_locked=False):
 
 
 def data_roots(containers):
-    result = {name: {'source': value, 'snapshot': 'data/' + name, 'kind': 'directory'} for name, value in ROOTS.items()}
+    result = {name: {'source': value, 'snapshot': 'data/' + name, 'kind': 'directory'}
+              for name, value in ROOTS.items() if name != 'plex-config'}
     for label, (volume_name, name, target) in VOLUMES.items():
         records = [row for row in containers[name]['Mounts'] if row['Destination'] == target
                    and row['Type'] == 'volume' and row.get('Name') == volume_name]
@@ -285,6 +289,10 @@ def data_roots(containers):
                 'prowlarr': '/config', 'usenet-ultimate': '/app/config', 'overseerr': '/app/config'}
     for name, target in required.items():
         paths = [Path(mount['Source']) for mount in containers[name]['Mounts'] if mount['Destination'] == target and mount['Type'] == 'bind']
+        if name == 'plex':
+            if paths != [Path(ROOTS['plex-config'])]:
+                raise RuntimeError('The existing Plex backup configuration binding differs.')
+            continue
         if len(paths) != 1 or not any(paths[0].is_relative_to(entry['source']) for entry in result.values() if entry['kind'] == 'directory'):
             raise RuntimeError('An application configuration binding is outside the copied source roots.')
     return result
@@ -322,7 +330,8 @@ def source_engine(catalog=None, roots=None):
             if engine.STATE.exists():raise RuntimeError('The pending source recovery catalogue is missing.')
             return engine
         catalog = json.loads(path.read_text())
-    engine.IMAGES = {name: catalog[name]['Image'] for name in APP_NAMES if name not in LIVE_STATIC}
+    engine.IMAGES = {name: catalog[name]['Image'] for name in APP_NAMES if name not in LIVE_STATIC
+                     and not (roots is not None and 'plex-config' not in roots and name == 'plex')}
     def inspect():
         current = inspect_source()
         for name, original in catalog.items():
@@ -437,7 +446,10 @@ def wait_quiet():
 
 
 def verify_databases(work, engine):
-    engine.verify(work)
+    if (work / 'data/plex-config').is_dir():
+        engine.verify(work)
+    else:
+        log('Plex is covered by its existing daily cloud backup; checking the copied application databases...')
     database = sqlite3.connect((work/'data/npm-data/database.sqlite').as_uri()+'?mode=ro',uri=True)
     try:
         referenced=set()
@@ -481,6 +493,31 @@ def verify_databases(work, engine):
     log('Additional copied SQLite databases verified: ' + str(count))
 
 
+def external_plex_backup(now=None):
+    if PLEX_BACKUP_HELPER.is_symlink() or digest(PLEX_BACKUP_HELPER) != PLEX_BACKUP_SHA:
+        raise RuntimeError('The existing Plex daily backup helper changed; no source applications were paused.')
+    if run('systemctl', 'show', '--no-pager', 'plex-daily-backup.service', '-p', 'Result', '--value').strip() != 'success':
+        raise RuntimeError('The last Plex daily backup did not succeed; no source applications were paused.')
+    rows = json.loads(run('sudo', '-u', 'sawdoctor', 'rclone', 'lsjson', 'gdrive:plex-backups',
+        '--files-only', '--max-depth', '1', '--contimeout', '15s', '--timeout', '60s', '--retries', '1', timeout=90))
+    candidates = []
+    for row in rows:
+        name = row.get('Name', '')
+        match = re.fullmatch(r'plex-config-(\d{4}-\d{2}-\d{2}-\d{4})\.tar\.gz', name)
+        if not match or row.get('IsDir') or type(row.get('Size')) is not int or row['Size'] <= 0:
+            continue
+        created = dt.datetime.strptime(match.group(1), '%Y-%m-%d-%H%M').replace(tzinfo=ZoneInfo('Europe/London')).astimezone(dt.timezone.utc)
+        age = (now or dt.datetime.now(dt.timezone.utc)) - created
+        if -dt.timedelta(minutes=5) <= age <= dt.timedelta(hours=30):
+            candidates.append((created, name, row['Size']))
+    if not candidates:
+        raise RuntimeError('No completed Plex cloud backup less than 30 hours old was found; source applications were not paused.')
+    created, name, size = max(candidates)
+    return {'remote': 'gdrive:plex-backups/' + name, 'archiveBytes': size,
+            'createdUtc': created.isoformat(), 'helperSha256': PLEX_BACKUP_SHA,
+            'check': 'existing backup service success plus completed remote archive listing; restore test separate'}
+
+
 def snapshot_source():
     source_resume()
     if not nighttime_pause_allowed():
@@ -488,6 +525,7 @@ def snapshot_source():
         return
     catalog = inspect_source(); roots = data_roots(catalog)
     validate_source_networks(catalog)
+    plex_backup = external_plex_backup()
     if not all(row['State']['Running'] for name, row in catalog.items() if name not in LIVE_STATIC):
         raise RuntimeError('A source application is deliberately stopped; its state was retained for review.')
     work = SOURCE_BASE / 'snapshot-work'
@@ -508,17 +546,22 @@ def snapshot_source():
                     if path.is_dir() and not path.is_symlink():shutil.rmtree(path)
                     else:path.unlink()
     bytes_needed = sum(int(run('du', '-sbx', '--', entry['source']).split()[0]) for entry in roots.values())
+    log('Nightly profile: other application state, custom code and symlinks; Plex uses its existing daily GDrive backup.')
+    log('Selected local state: ' + str(round(bytes_needed/1024**3,2)) + ' GiB; free source space: ' +
+        str(round(shutil.disk_usage(SOURCE_BASE).free/1024**3,2)) + ' GiB.')
     if shutil.disk_usage(SOURCE_BASE).free < 2 * bytes_needed + 2 * 1024**3:
         raise RuntimeError('The OptiPlex needs more free local space for the consistent standby snapshot.')
     engine = source_engine(catalog, roots)
-    engine.check_sqlite_tool()
+    if 'plex-config' in roots:
+        engine.check_sqlite_tool()
     write_json(SOURCE_BASE / 'catalog.json', catalog)
     stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     manifest = {'format': FORMAT, 'sourceHost': '192.168.0.29', 'scope': 'standby-only',
+        'profile': NIGHTLY_PROFILE, 'plexConfigIncluded': False, 'externalPlexBackup': plex_backup,
         'createdUtc': stamp, 'dataRoots': roots, 'containers': list(catalog.values()),
         'images': json.loads(run('docker', 'image', 'inspect', *sorted({row['Image'] for row in catalog.values()}))),
         'imageArchivesIncluded': False}
-    log('Pre-copying application state, Plex/NPM data, custom host files and library symlinks...')
+    log('Pre-copying application state, NPM data, custom host files and library symlinks; Plex config is excluded...')
     copy_roots(work, roots, live=True)
     if not wait_quiet():
         return
@@ -559,6 +602,7 @@ def snapshot_source():
     partial.chmod(0o600); os.chown(partial, *ids)
     size = int(run('du', '-sbx', '--', str(work)).split()[0])
     metadata = {'format': FORMAT, 'createdUtc': stamp, 'sha256': digest(partial),
+                'profile': NIGHTLY_PROFILE,
                 'archiveBytes': partial.stat().st_size, 'unpackedBytes': size}
     partial.replace(OUTPUT / 'export.tar.zst')
     write_json(OUTPUT / 'ready.json', metadata, owner=ids)
@@ -584,8 +628,15 @@ def prune_snapshots(root, current):
         marker = path / '_VERIFIED.json'
         if marker.is_file() and json.loads(marker.read_text()).get('format') == FORMAT:
             finished.append(path)
-    for path in sorted(finished)[:-2]:
-        if path != current:
+    # Keep the two newest standby copies AND the newest verified full Plex copy.
+    # This preserves the last full rollback while lean snapshots are trialled.
+    keep = set(sorted(finished)[-2:]) | {current}
+    full = [path for path in finished if (path/'data/plex-config').is_dir()
+            and not (path/'data/plex-config').is_symlink()]
+    if full:
+        keep.add(max(full))
+    for path in sorted(finished):
+        if path not in keep:
             shutil.rmtree(path)
 
 
