@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -52,6 +53,11 @@ class CleanupTests(unittest.TestCase):
         (source / 'config/db.sqlite').write_bytes(b'fixture database\n')
         (source / 'images.tar').write_bytes(b'exact images fixture\n')
         (source / 'media-link.mkv').symlink_to('/mnt/nzbdav/.ids/do-not-dereference')
+        if name == 'books-optiplex':
+            for relative in s.BOOKS_SHM_TIMESTAMPS:
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'unchanged shared-memory bytes\n')
         sums = []
         for path in sorted(source.rglob('*')):
             if path.is_file() and not path.is_symlink():
@@ -175,6 +181,68 @@ class CleanupTests(unittest.TestCase):
         before = self.state()
         s.cleanup_locked()
         self.assertEqual(self.state(), before)
+
+    def change_mtime(self, path):
+        value = path.stat()
+        os.utime(path, ns=(value.st_atime_ns, value.st_mtime_ns + 5_000_000_000))
+
+    def test_exact_seven_shm_timestamp_differences_allow_cleanup_without_changing_any_saved_file(self):
+        for relative in s.BOOKS_SHM_TIMESTAMPS:
+            self.change_mtime(self.ssd / 'migration/books-optiplex/snapshot' / relative)
+        before = self.state()
+        s.cleanup_locked()
+        after = self.state()
+        for name, value in before.items():
+            if not name.endswith('/export.tar.zst') or 'infinidysk-optiplex' in name:
+                self.assertEqual(after[name], value)
+        record = json.loads((self.ssd / 'migration/transfer-archive-cleanup/record.json').read_text())
+        books = next(item for item in record['items'] if item['archive'].endswith('books-optiplex/export.tar.zst'))
+        self.assertEqual(set(books['acceptedShmTimestampPaths']), s.BOOKS_SHM_TIMESTAMPS)
+
+    def test_reviewed_shm_timestamp_difference_does_not_hide_content_changes(self):
+        path = self.ssd / 'migration/books-optiplex/snapshot' / sorted(s.BOOKS_SHM_TIMESTAMPS)[0]
+        path.write_bytes(b'different shared-memory bytes')
+        self.change_mtime(path)
+        with self.assertRaisesRegex(RuntimeError, 'comparison failed'):
+            s.cleanup_locked()
+        self.assert_all_archives_retained()
+
+    def test_reviewed_shm_timestamp_difference_does_not_hide_mode_changes(self):
+        path = self.ssd / 'migration/books-optiplex/snapshot' / sorted(s.BOOKS_SHM_TIMESTAMPS)[0]
+        self.change_mtime(path)
+        path.chmod(0o700)
+        with self.assertRaisesRegex(RuntimeError, 'comparison failed'):
+            s.cleanup_locked()
+        self.assert_all_archives_retained()
+
+    def test_timestamp_exception_does_not_cover_database_file_mtime(self):
+        shm = self.ssd / 'migration/books-optiplex/snapshot' / sorted(s.BOOKS_SHM_TIMESTAMPS)[0]
+        self.change_mtime(shm)
+        self.change_mtime(self.ssd / 'migration/books-optiplex/snapshot/config/db.sqlite')
+        with self.assertRaisesRegex(RuntimeError, 'comparison failed'):
+            s.cleanup_locked()
+        self.assert_all_archives_retained()
+
+    def test_matching_diagnostic_with_tar_error_status_two_is_rejected(self):
+        audit = self.ssd / 'error.log'
+        relative = sorted(s.BOOKS_SHM_TIMESTAMPS)[0]
+        def failed(command, **kwargs):
+            kwargs['stdout'].write(('./' + relative + ': Mod time differs\n').encode())
+            return subprocess.CompletedProcess(command, 2)
+        with patch.object(s.subprocess, 'run', side_effect=failed):
+            with self.assertRaisesRegex(RuntimeError, 'comparison failed'):
+                s.checked(['tar', '--compare'], self.ssd, audit, {relative})
+
+    def test_timestamp_exception_is_not_used_for_files_missing_from_checksum_manifest(self):
+        path = self.ssd / 'migration/books-optiplex/snapshot' / sorted(s.BOOKS_SHM_TIMESTAMPS)[0]
+        self.change_mtime(path)
+        original = s.verify_checksums_paths
+        def uncovered(snapshot, checksums):
+            return original(snapshot, checksums) - s.BOOKS_SHM_TIMESTAMPS
+        with patch.object(s, 'verify_checksums_paths', side_effect=uncovered):
+            with self.assertRaisesRegex(RuntimeError, 'comparison failed'):
+                s.cleanup_locked()
+        self.assert_all_archives_retained()
 
 
 if __name__ == '__main__':
