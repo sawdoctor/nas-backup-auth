@@ -133,6 +133,15 @@ def properties(unit):
     return dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
 
 
+def expected_dropin(props, destination, allow_absent=False):
+    # systemctl quotes string-list paths and doubles literal backslashes.
+    # These fixed ASCII destinations need only the plain and quoted forms;
+    # compare the complete value so additional overrides still fail closed.
+    actual = props.get('DropInPaths')
+    return ((allow_absent and actual == '')
+            or actual in (destination, json.dumps(destination)))
+
+
 def template_check(text):
     required = {'ExecStart=/usr/sbin/quotaon -ug %f', 'Type=oneshot',
                 'RemainAfterExit=yes', 'DefaultDependencies=no', 'BindsTo=%i.mount'}
@@ -173,7 +182,7 @@ def plan():
         no_links(destination)
         props = properties(unit)
         if (props.get('FragmentPath') != str(BASE)
-                or props.get('DropInPaths', '').split() not in ([], [str(destination)])
+                or not expected_dropin(props, str(destination), allow_absent=True)
                 or props.get('ActiveState') not in ('inactive', 'failed', 'active')):
             raise RuntimeError('An existing quota override or active transition needs review.')
         if destination.parent.exists():
@@ -221,10 +230,12 @@ def repair():
             for item in entries:
                 run('systemctl', 'start', item['unit'], timeout=60)
                 props = properties(item['unit'])
-                if (props.get('DropInPaths', '').split() != [item['dropin']]
-                        or props.get('ActiveState') not in ('inactive', 'active')
-                        or checker_namespace()['quota_state'](item['mount']) != {'user': 'on', 'group': 'on'}):
-                    raise RuntimeError('The quota startup check did not verify; inspect its service journal.')
+                if not expected_dropin(props, item['dropin']):
+                    raise RuntimeError('The loaded quota override differs from the expected single precheck.')
+                if props.get('ActiveState') not in ('inactive', 'active'):
+                    raise RuntimeError('The quota startup unit did not reach its expected skipped/active state.')
+                if checker_namespace()['quota_state'](item['mount']) != {'user': 'on', 'group': 'on'}:
+                    raise RuntimeError('The user/group quotas did not remain enabled after the startup check.')
                 say(item['mount'] + ': user/group quotas ON; startup precheck verified.')
             if BASE.read_bytes() != template:
                 raise RuntimeError('The packaged quota definition changed during repair.')
