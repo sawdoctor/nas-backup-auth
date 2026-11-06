@@ -16,6 +16,7 @@ if not SCRIPTS.is_dir():
 spec = importlib.util.spec_from_file_location('quota_boot_repair', SCRIPTS / 'repair-nas-quota-boot.py')
 s = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(s)
+REAL_CHECKER_NAMESPACE = s.checker_namespace
 
 TEMPLATE = '''[Unit]
 DefaultDependencies=no
@@ -39,7 +40,7 @@ class CheckerTests(unittest.TestCase):
     def results(self, user='on', group='on'):
         uuid = self.path.removeprefix('/srv/dev-disk-by-uuid-')
         text = f'group quota on {self.path} (/dev/sda1) is {group}\nuser quota on {self.path} (/dev/sda1) is {user}\n'
-        return [completed(uuid + ' ext4\n'), completed(text)]
+        return [completed(uuid + ' ext4\n'), completed(text, (user == 'on') + (group == 'on'))]
 
     def call(self, results, main=False):
         with patch.object(Path, 'is_mount', return_value=True), patch.object(Path, 'is_symlink', return_value=False), \
@@ -59,6 +60,26 @@ class CheckerTests(unittest.TestCase):
             with self.subTest(user=user, group=group):
                 self.assertEqual(self.call(self.results(user, group), main=True)[0], 0)
 
+    def test_reported_nas_queries_return_two_with_both_quotas_on(self):
+        for path, device in zip(s.TARGETS, ('/dev/sda1', '/dev/nvme1n1p1')):
+            with self.subTest(path=path):
+                self.path = path
+                uuid = path.removeprefix('/srv/dev-disk-by-uuid-')
+                output = (f'group quota on {path} ({device}) is on\n'
+                          f'user quota on {path} ({device}) is on\n')
+                state, _ = self.call([completed(uuid + ' ext4\n'), completed(output, 2)])
+                self.assertEqual(state, {'user': 'on', 'group': 'on'})
+
+    def test_exit_status_must_equal_enabled_quota_count(self):
+        for user, group in (('on', 'on'), ('on', 'off'), ('off', 'on'), ('off', 'off')):
+            for code in (-15, 0, 1, 2, 3, 255):
+                if code == (user == 'on') + (group == 'on'):
+                    continue
+                values = self.results(user, group)
+                values[1].returncode = code
+                with self.subTest(user=user, group=group, code=code), self.assertRaises(RuntimeError):
+                    self.call(values)
+
     def test_wrong_filesystem_identity_rejected(self):
         with self.assertRaisesRegex(RuntimeError, 'identity'):
             self.call([completed('different-uuid ext4\n')])
@@ -75,10 +96,11 @@ class CheckerTests(unittest.TestCase):
 
     def test_missing_duplicate_wrong_target_and_error_states_rejected(self):
         good = self.results()[1].stdout
-        bad = [completed(good, 1), completed(good, stderr='query error'),
-               completed(good.splitlines()[0] + '\n'), completed(good + good),
-               completed(good.replace(self.path, '/another/path')),
-               completed(good.replace('is on', 'is unknown'))]
+        bad = [completed(good, 1), completed(good, 2, stderr='query error'),
+               completed(good.splitlines()[0] + '\n', 2), completed(good + good, 2),
+               completed(good.replace(self.path, '/another/path'), 2),
+               completed(good.replace('is on', 'is unknown'), 2),
+               completed(good.replace('user quota', 'group quota'), 2)]
         for value in bad:
             with self.subTest(value=value), self.assertRaises(RuntimeError):
                 self.call([self.results()[0], value])
@@ -150,6 +172,29 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(record['quotaLimitsChanged'])
         self.assertTrue(all(call[0] != 'quotaon' for call in self.calls))
         self.assertFalse(any('stop' in call or 'restart' in call or 'quotaoff' in call for call in self.calls))
+
+    def test_installer_accepts_real_both_on_query_status(self):
+        original_run = subprocess.run
+        original_is_mount = Path.is_mount
+        queries = []
+        def query(args, *positional, **kwargs):
+            if args[0] == '/usr/bin/findmnt':
+                path = args[3]
+                return completed(path.removeprefix('/srv/dev-disk-by-uuid-') + ' ext4\n')
+            if args[0] == '/usr/sbin/quotaon':
+                path = args[-1]
+                queries.append(path)
+                return completed(f'group quota on {path} (/dev/sda1) is on\n'
+                                 f'user quota on {path} (/dev/sda1) is on\n', 2)
+            return original_run(args, *positional, **kwargs)
+        def mounted(path):
+            return str(path) in s.TARGETS or original_is_mount(path)
+        with patch.object(s, 'checker_namespace', side_effect=REAL_CHECKER_NAMESPACE), \
+                patch.object(s.subprocess, 'run', side_effect=query), patch.object(Path, 'is_mount', mounted):
+            s.repair()
+        self.assertEqual(queries, [*s.TARGETS, *s.TARGETS])
+        self.assertEqual(json.loads((self.work / 'result.json').read_text())['phase'], 'complete')
+        self.assertEqual(self.base.read_text(), TEMPLATE)
 
     def test_changed_vendor_command_is_retained_without_writes(self):
         self.base.write_text(TEMPLATE.replace('-ug %f', '-a'))
