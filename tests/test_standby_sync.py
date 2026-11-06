@@ -380,7 +380,7 @@ class StandbyTests(unittest.TestCase):
             before=(source/'database.sqlite').read_bytes();before_wal=(source/'database.sqlite-wal').read_bytes()
             target.write_bytes(b'old staging database');Path(str(target)+'-wal').write_bytes(b'old staging wal')
             with patch.multiple(s,ROOTS={'npm-data':str(source)}):s.snapshot_npm_database(work)
-            with sqlite3.connect(target) as copied:
+            with contextlib.closing(sqlite3.connect(target)) as copied:
                 self.assertEqual(copied.execute('SELECT value FROM fixture').fetchall(),[('committed live value',)])
                 self.assertEqual(copied.execute('PRAGMA journal_mode').fetchone()[0],'delete')
             self.assertEqual((source/'database.sqlite').read_bytes(),before)
@@ -401,7 +401,7 @@ class StandbyTests(unittest.TestCase):
     def test_lean_database_checks_verify_npm_without_accessing_plex(self):
         with tempfile.TemporaryDirectory() as directory:
             work=Path(directory);database=work/'data/npm-data/database.sqlite';database.parent.mkdir(parents=True)
-            with sqlite3.connect(database) as db:db.execute('CREATE TABLE fixture(value TEXT)')
+            with contextlib.closing(sqlite3.connect(database)) as db:db.execute('CREATE TABLE fixture(value TEXT)')
             engine=types.SimpleNamespace(verify=Mock(side_effect=AssertionError('Plex must not be read')))
             with contextlib.redirect_stdout(io.StringIO()):s.verify_databases(work,engine)
             engine.verify.assert_not_called()
