@@ -24,6 +24,17 @@ BUNDLES = {
     'support-optiplex': 'sawdoctor-support-export-v1',
     'plex-npm-optiplex': 'sawdoctor-plex-npm-export-v1',
 }
+# These seven copied SQLite shared-memory files have identical checksums but
+# changed timestamps in the user's saved comparison. No other mismatch is waived.
+BOOKS_SHM_TIMESTAMPS = frozenset({
+    'data/stackarr-shelfmark/config/stackarr.db-shm',
+    'data/rdtclient-books/db/rdtclient.db-shm',
+    'data/shelfmark-ebooks/config/users.db-shm',
+    'data/audiobookrequest/config/db.sqlite-shm',
+    'data/shelfmark-torbox/config/users.db-shm',
+    'data/kavita/config/kavita.db-shm',
+    'data/kavita/config/cache.db-shm',
+})
 
 
 def say(message):
@@ -108,7 +119,7 @@ def guard():
 
 def verify_checksums_paths(snapshot, checksums):
     # GNU checksum input must not follow a replaced link into a streaming mount.
-    count = 0
+    covered = set()
     with checksums.open() as source:
         for line in source:
             if not re.match(r'^[a-f0-9]{64} [ *]', line):
@@ -118,20 +129,31 @@ def verify_checksums_paths(snapshot, checksums):
             if relative.is_absolute() or '..' in relative.parts or not relative.parts:
                 raise RuntimeError('An unsafe checksum path was retained.')
             regular(snapshot / relative)
-            count += 1
-    if count < 3:
+            covered.add(str(relative))
+    if len(covered) < 3:
         raise RuntimeError('The saved snapshot checksum list is incomplete.')
+    return covered
 
 
-def checked(command, snapshot, error_path):
+def checked(command, snapshot, error_path, allowed_mtime_paths=frozenset()):
     no_symlinks(error_path)
     with error_path.open('wb') as errors:
         result = subprocess.run(command, cwd=snapshot, stdout=errors, stderr=errors,
-                                timeout=7200, check=False)
+                                timeout=7200, check=False,
+                                env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C', 'TAR_OPTIONS': ''})
+    accepted = []
     if result.returncode:
-        raise RuntimeError('Snapshot comparison failed; all candidate archives were retained. '
-                           'Private details: ' + str(error_path))
+        allowed_messages = {'./' + name + ': Mod time differs': name for name in allowed_mtime_paths}
+        lines = (error_path.read_text(errors='replace').splitlines()
+                 if error_path.stat().st_size <= 65536 else [])
+        if (result.returncode == 1 and command[:2] == ['tar', '--compare']
+                and lines and all(line in allowed_messages for line in lines)):
+            accepted = sorted({allowed_messages[line] for line in lines})
+        else:
+            raise RuntimeError('Snapshot comparison failed; all candidate archives were retained. '
+                               'Private details: ' + str(error_path))
     error_path.unlink()
+    return accepted
 
 
 def verify_bundle(stage, expected_format, error_path):
@@ -156,18 +178,23 @@ def verify_bundle(stage, expected_format, error_path):
     say(stage.name + ': checking the compressed archive identity...')
     if digest(archive) != expected_hash:
         raise RuntimeError('A compressed archive checksum differs; all archives were retained.')
-    verify_checksums_paths(snapshot, paths[3])
+    covered = verify_checksums_paths(snapshot, paths[3])
     say(stage.name + ': verifying retained file checksums...')
     checked(['sha256sum', '--quiet', '--strict', '-c', 'SHA256SUMS'], snapshot, error_path)
     say(stage.name + ': comparing archive contents, links and saved metadata...')
-    checked(['tar', '--compare', '--numeric-owner', '--acls', '--xattrs',
-             '-I', 'zstd', '-f', str(archive)], snapshot, error_path)
+    allowed = BOOKS_SHM_TIMESTAMPS & covered if stage.name == 'books-optiplex' else frozenset()
+    accepted = checked(['tar', '--compare', '--numeric-owner', '--acls', '--xattrs',
+                        '-I', 'zstd', '-f', str(archive)], snapshot, error_path, allowed)
+    if accepted:
+        say(stage.name + ': ' + str(len(accepted)) +
+            ' reviewed SQLite shared-memory timestamps differ; contents and other comparisons match.')
     for path, before in saved.items():
         if fingerprint(Path(path)) != before:
             raise RuntimeError('A transfer changed during verification; all archives were retained.')
     return {'archive': str(archive), 'snapshot': str(snapshot),
             'sha256': expected_hash, 'archiveBytes': saved[str(archive)][2],
-            'createdUtc': manifest['createdUtc'], 'status': 'verified', 'fingerprints': saved}
+            'createdUtc': manifest['createdUtc'], 'status': 'verified', 'fingerprints': saved,
+            'acceptedShmTimestampPaths': accepted}
 
 
 def cleanup_locked():
