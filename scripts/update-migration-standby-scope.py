@@ -28,7 +28,7 @@ NAS_HELPER = Path('/usr/local/sbin/nas-plex-npm-stage')
 NAS_HELPER_SHA = '29bdb0e6a73ec3e71042b7d4bfd4acf42067d39083a820c088e3cea8a91f21b1'
 OLD_PRUNE = "def prune_snapshots(root, current):\n    finished = []\n    for path in root.iterdir():\n        if path.is_symlink() or not path.is_dir() or not re.fullmatch('[0-9]{8}T[0-9]{6}Z', path.name):\n            continue\n        marker = path / '_VERIFIED.json'\n        if marker.is_file() and json.loads(marker.read_text()).get('format') == FORMAT:\n            finished.append(path)\n    for path in sorted(finished)[:-2]:\n        if path != current:\n            shutil.rmtree(path)"
 NEW_PRUNE = "def prune_snapshots(root, current):\n    finished = []\n    for path in root.iterdir():\n        if path.is_symlink() or not path.is_dir() or not re.fullmatch('[0-9]{8}T[0-9]{6}Z', path.name):\n            continue\n        marker = path / '_VERIFIED.json'\n        if marker.is_file() and json.loads(marker.read_text()).get('format') == FORMAT:\n            finished.append(path)\n    # Keep the two newest standby copies AND the newest verified full Plex copy.\n    # This preserves the last full rollback while lean snapshots are trialled.\n    keep = set(sorted(finished)[-2:]) | {current}\n    full = [path for path in finished if (path/'data/plex-config').is_dir()\n            and not (path/'data/plex-config').is_symlink()]\n    if full:\n        keep.add(max(full))\n    for path in sorted(finished):\n        if path not in keep:\n            shutil.rmtree(path)"
-EXPECTED_ASSIGNMENTS = {"SIGNATURE":"Constant(value='Sawdoctor nightly migration standby snapshots v1')","FORMAT":"Constant(value='sawdoctor-migration-standby-v1')","WORKER":"Call(func=Name(id='Path', ctx=Load()), args=[Constant(value='/usr/local/sbin/nas-migration-standby')], keywords=[])","SSD":"Call(func=Name(id='Path', ctx=Load()), args=[Constant(value='/srv/dev-disk-by-uuid-e5af079d-1bbd-4ad2-a94b-5a6dbaf8b4d6')], keywords=[])","NAS_BASE":"BinOp(left=Name(id='SSD', ctx=Load()), op=Div(), right=Constant(value='migration/nightly-standby'))","NAS_HELPER":"Call(func=Name(id='Path', ctx=Load()), args=[Constant(value='/usr/local/sbin/nas-plex-npm-stage')], keywords=[])","NAS_SHA":"Constant(value='29bdb0e6a73ec3e71042b7d4bfd4acf42067d39083a820c088e3cea8a91f21b1')","APP_NAMES":"Tuple(elts=[Constant(value='plex'), Constant(value='npm-app-1'), Constant(value='kometa'), Constant(value='houndarr'), Constant(value='homepage'), Constant(value='uptime-kuma'), Constant(value='speedtest-tracker'), Constant(value='wizarr'), Constant(value='tracearr'), Constant(value='sonarr'), Constant(value='radarr'), Constant(value='radarr4k'), Constant(value='prowlarr'), Constant(value='usenet-ultimate'), Constant(value='overseerr'), Constant(value='abr-shelfmark-bridge'), Constant(value='audiobookrequest'), Constant(value='audiobookshelf-test'), Constant(value='kavita'), Constant(value='sabnzbd-ebooks'), Constant(value='shelfmark-ebooks'), Constant(value='shelfmark-torbox'), Constant(value='stackarr-ebooks'), Constant(value='nzbdav'), Constant(value='tracearr-redis'), Constant(value='tracearr-db'), Constant(value='glances'), Constant(value='torbox-media-center')], ctx=Load())"}
+EXPECTED_EXPRESSIONS = {"SIGNATURE":"'Sawdoctor nightly migration standby snapshots v1'","FORMAT":"'sawdoctor-migration-standby-v1'","WORKER":"Path('/usr/local/sbin/nas-migration-standby')","SSD":"Path('/srv/dev-disk-by-uuid-e5af079d-1bbd-4ad2-a94b-5a6dbaf8b4d6')","NAS_BASE":"SSD / 'migration/nightly-standby'","NAS_HELPER":"Path('/usr/local/sbin/nas-plex-npm-stage')","NAS_SHA":"'29bdb0e6a73ec3e71042b7d4bfd4acf42067d39083a820c088e3cea8a91f21b1'","APP_NAMES":"('plex', 'npm-app-1', 'kometa', 'houndarr', 'homepage', 'uptime-kuma',\n    'speedtest-tracker', 'wizarr', 'tracearr', 'sonarr', 'radarr', 'radarr4k',\n    'prowlarr', 'usenet-ultimate', 'overseerr', 'abr-shelfmark-bridge',\n    'audiobookrequest', 'audiobookshelf-test', 'kavita', 'sabnzbd-ebooks',\n    'shelfmark-ebooks', 'shelfmark-torbox', 'stackarr-ebooks', 'nzbdav',\n    'tracearr-redis', 'tracearr-db', 'glances', 'torbox-media-center')"}
 
 
 def say(value):
@@ -76,9 +76,16 @@ def locked(stack, path):
 
 
 def inactive(unit):
-    result = subprocess.run(['systemctl', 'show', '--no-pager', unit, '-p', 'ActiveState', '--value'],
+    result = subprocess.run(['systemctl', 'show', '--no-pager', unit, '-p', 'LoadState', '-p', 'ActiveState'],
                             text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
-    if result.returncode or result.stdout.strip() not in ('inactive', 'failed'):
+    properties = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+    # The transient installer is normally garbage-collected after completion.
+    if (unit == 'nas-migration-standby-install.service'
+            and properties.get('LoadState') == 'not-found'
+            and properties.get('ActiveState') == 'inactive' and result.returncode in (0, 1)):
+        return
+    if (result.returncode or properties.get('LoadState') != 'loaded'
+            or properties.get('ActiveState') not in ('inactive', 'failed')):
         raise RuntimeError('The related service is busy or unavailable; no worker was changed: ' + unit)
 
 
@@ -88,7 +95,11 @@ def nas_patch(original):
     values = {node.targets[0].id: ast.dump(node.value, include_attributes=False)
               for node in tree.body if isinstance(node, ast.Assign) and len(node.targets) == 1
               and isinstance(node.targets[0], ast.Name)}
-    if any(values.get(key) != value for key, value in EXPECTED_ASSIGNMENTS.items()):
+    # Parse both sides on this host: ast.dump's empty-field formatting changed
+    # in Python 3.13, so a dump produced on 3.12 is not a portable fingerprint.
+    expected = {key: ast.dump(ast.parse(expression, mode='eval').body, include_attributes=False)
+                for key, expression in EXPECTED_EXPRESSIONS.items()}
+    if any(values.get(key) != value for key, value in expected.items()):
         raise RuntimeError('The existing NAS standby identity differs; it was retained.')
     nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'prune_snapshots']
     if len(nodes) != 1:
@@ -150,6 +161,20 @@ def install_locked(role, base, original, proposed):
     else:
         validate_helper(NAS_HELPER, NAS_HELPER_SHA)
     if proposed == original:
+        work = base / 'scope-change'
+        no_links(work)
+        work.mkdir(mode=0o700, exist_ok=True)
+        record = work / 'applied.json'
+        no_links(record)
+        if not record.exists():
+            atomic(record, (json.dumps({'format': FORMAT, 'role': role,
+                'afterSha256': sha(proposed), 'verifiedOnly': True,
+                'verifiedUtc': datetime.datetime.now(datetime.timezone.utc).isoformat()},
+                indent=2) + '\n').encode())
+        else:
+            value = json.loads(record.read_text())
+            if value.get('format') != FORMAT or value.get('role') != role or value.get('afterSha256') != sha(proposed):
+                raise RuntimeError('The saved scope receipt differs; it was retained.')
         say('This standby scope update is already applied on ' + role + '.')
         return
     work = base / 'scope-change'
