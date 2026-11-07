@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Skip duplicate quota activation only for two verified NAS filesystems."""
+"""Skip duplicate quota activation only for three verified NAS filesystems."""
 import contextlib
 import datetime
 import fcntl
@@ -15,7 +15,8 @@ import sys
 import tempfile
 
 SSDUUID = 'e5af079d-1bbd-4ad2-a94b-5a6dbaf8b4d6'
-UUIDS = (SSDUUID, '1f12a22e-5cfe-4b02-8d4b-48e9bf5fec6a')
+BACKUP_UUID = '631e3391-6a42-4158-9aa4-f7718ba0e7e9'
+UUIDS = (SSDUUID, '1f12a22e-5cfe-4b02-8d4b-48e9bf5fec6a', BACKUP_UUID)
 TARGETS = tuple('/srv/dev-disk-by-uuid-' + item for item in UUIDS)
 SSD = Path(TARGETS[0])
 CHECKER = Path('/usr/local/libexec/nas-quota-boot-check')
@@ -27,7 +28,8 @@ UNIT = 'nas-quota-boot-repair'
 DROPIN = '50-nas-already-enabled.conf'
 FORMAT = 'sawdoctor-nas-quota-boot-precheck-v1'
 
-CHECKER_CODE = r'''#!/usr/bin/python3
+ORIGINAL_CHECKER_SHA = 'e2893f0d23c3d0dc34f566072e330396643eea08deb7911b1e2546b97be9584b'
+ORIGINAL_CHECKER_CODE = r'''#!/usr/bin/python3
 """Read-only systemd ExecCondition: 1=already on, 0=enable normally, 255=error."""
 import os
 from pathlib import Path
@@ -79,6 +81,10 @@ if __name__ == '__main__':
         code = 255
     sys.exit(code)
 '''
+CHECKER_CODE = ORIGINAL_CHECKER_CODE.replace(
+    "           '/srv/dev-disk-by-uuid-1f12a22e-5cfe-4b02-8d4b-48e9bf5fec6a')",
+    "           '/srv/dev-disk-by-uuid-1f12a22e-5cfe-4b02-8d4b-48e9bf5fec6a',\n"
+    "           '/srv/dev-disk-by-uuid-" + BACKUP_UUID + "')", 1)
 
 
 def say(message):
@@ -112,6 +118,11 @@ def atomic(path, data, mode=0o600):
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, path)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -162,11 +173,14 @@ def filesystem_check(path):
 
 
 def plan():
+    if digest(ORIGINAL_CHECKER_CODE.encode()) != ORIGINAL_CHECKER_SHA:
+        raise RuntimeError('The reviewed original quota checker identity differs.')
     no_links(BASE)
     template = BASE.read_bytes()
     template_check(template.decode())
     no_links(CHECKER)
-    if CHECKER.exists() and (not CHECKER.is_file() or CHECKER.read_bytes() != CHECKER_CODE.encode()
+    if CHECKER.exists() and (not CHECKER.is_file() or CHECKER.read_bytes() not in
+                             (ORIGINAL_CHECKER_CODE.encode(), CHECKER_CODE.encode())
                              or stat.S_IMODE(CHECKER.stat().st_mode) != 0o700 or CHECKER.stat().st_uid != 0):
         raise RuntimeError('An existing quota condition helper differs; it was retained.')
     check = checker_namespace()['quota_state']
@@ -214,10 +228,20 @@ def repair():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError('NAS backup/recovery is busy; retry the quota repair later.') from None
-        say('Verifying both quota states and the existing packaged startup definitions...')
+        say('Verifying all three quota mounts and the existing packaged startup definitions...')
         template, entries = plan()
         CHECKER.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-        if not CHECKER.exists():
+        if CHECKER.exists() and CHECKER.read_bytes() == ORIGINAL_CHECKER_CODE.encode():
+            no_links(WORK)
+            WORK.mkdir(mode=0o700, parents=True, exist_ok=True)
+            previous = WORK / 'checker.before-fikwot'
+            no_links(previous)
+            if previous.exists() and (not previous.is_file() or previous.read_bytes() != ORIGINAL_CHECKER_CODE.encode()):
+                raise RuntimeError('A different original-checker recovery copy was retained.')
+            if not previous.exists():
+                atomic(previous, ORIGINAL_CHECKER_CODE.encode())
+            atomic(CHECKER, CHECKER_CODE.encode(), 0o700)
+        elif not CHECKER.exists():
             atomic(CHECKER, CHECKER_CODE.encode(), 0o700)
         for item in entries:
             destination = Path(item['dropin'])
@@ -243,8 +267,8 @@ def repair():
         except BaseException:
             record('verification-needs-review', template, entries)
             raise
-    say('NAS QUOTA BOOT PRECHECK INSTALLED. Both quota states remain ON.')
-    say('Only these two quota instances were changed; no quotas were disabled or reset.')
+    say('NAS QUOTA BOOT PRECHECK INSTALLED. All three filesystems retain user/group quotas ON.')
+    say('The FIKWOT backup SSD is now covered by the same scoped precheck as the other two drives.')
     say('Mount options, filesystem features, limits, applications and OptiPlex were retained.')
     say('The precheck intentionally skips an already-enabled unit; inactive/skipped is expected.')
 
