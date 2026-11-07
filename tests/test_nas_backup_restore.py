@@ -217,6 +217,29 @@ class RestoreTests(unittest.TestCase):
                 s.test_locked()
         self.assertFalse(list(self.sets.parent.glob('.nas-sample-restore-*')))
 
+    def test_guard_requires_mounted_backup_volume_and_known_nas(self):
+        with patch.object(s.os, 'geteuid', return_value=0), \
+                patch.object(s.subprocess, 'check_output', return_value='inet 192.168.0.220/24'), \
+                patch.object(Path, 'is_mount', return_value=False), self.assertRaisesRegex(s.RestoreError, 'mounted FIKWOT'):
+            s.guard()
+        self.assertFalse(s.WORK.exists())
+
+    def test_guard_rejects_other_uuid_or_filesystem_before_restore(self):
+        for identity in ('other-uuid ext4', s.BACKUP_UUID + ' xfs'):
+            with self.subTest(identity=identity), patch.object(s.os, 'geteuid', return_value=0), \
+                    patch.object(Path, 'is_mount', return_value=True), \
+                    patch.object(s.subprocess, 'check_output', side_effect=['inet 192.168.0.220/24', identity]), \
+                    self.assertRaisesRegex(s.RestoreError, 'identity differs'):
+                s.guard()
+        self.assertFalse(s.WORK.exists())
+
+    def test_guard_accepts_exact_mounted_fikwot_ext4_volume(self):
+        with patch.object(s.os, 'geteuid', return_value=0), patch.object(Path, 'is_mount', return_value=True), \
+                patch.object(s.shutil, 'which', return_value='/usr/bin/existing-program'), \
+                patch.object(s.subprocess, 'check_output', side_effect=[
+                    'inet 192.168.0.220/24', s.BACKUP_UUID + ' ext4\n']):
+            s.guard()
+
 
 if __name__ == '__main__':
     unittest.main()
