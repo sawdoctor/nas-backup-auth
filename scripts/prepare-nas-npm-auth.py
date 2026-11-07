@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
 APP_UUID = 'e5af079d-1bbd-4ad2-a94b-5a6dbaf8b4d6'
@@ -100,11 +101,24 @@ def jail_names(text):
 
 
 def cf_ranges():
-    with urllib.request.urlopen('https://www.cloudflare.com/ips-v4', timeout=15) as response:
-        data = response.read(16385)
+    # The human-facing www endpoint can reject requests from server networks.
+    # Use Cloudflare's documented, unauthenticated public IP-list API instead.
+    try:
+        with urllib.request.urlopen('https://api.cloudflare.com/client/v4/ips', timeout=15) as response:
+            data = response.read(16385)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError('Cloudflare IP-list API returned HTTP ' + str(error.code)
+                           + '; no setup files were changed.') from None
+    except (urllib.error.URLError, TimeoutError):
+        raise RuntimeError('Cloudflare IP-list API could not be reached; no setup files were changed.') from None
     if len(data) > 16384:
         raise RuntimeError('The Cloudflare range list is unexpectedly large.')
-    parsed = tuple(sorted(str(ipaddress.IPv4Network(line)) for line in data.decode('ascii').split()))
+    document = json.loads(data)
+    ranges = document.get('result', {}).get('ipv4_cidrs') if isinstance(document, dict) else None
+    if (not isinstance(document, dict) or document.get('success') is not True
+            or not isinstance(ranges, list) or not all(isinstance(line, str) for line in ranges)):
+        raise RuntimeError('Cloudflare IP-list API returned an unexpected response; no setup files were changed.')
+    parsed = tuple(sorted(str(ipaddress.IPv4Network(line)) for line in ranges))
     if parsed != CF:
         raise RuntimeError('Cloudflare ranges differ from the reviewed list; no setup change was made.')
     return parsed
