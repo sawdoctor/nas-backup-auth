@@ -20,8 +20,9 @@ HELPERS = {
     'routes': ('prepare-nas-npm-routes.py', '15516852f1f1fb02bc7647a1c2f72097b7e37c0bf834ec5a5e9a0e95ea92d7a2'),
     'restore': ('prepare-nas-npm.py', 'ff074e2273d62ac47a56b4fcc807b6af2ff409d65a3c2c4f3f6c8a236471c10e'),
 }
-FORMAT = 'sawdoctor-npm-complete-offline-v1'
+FORMAT = 'sawdoctor-npm-complete-offline-v2'
 LIMIT = 512 * 1024**2
+RETIRED = {'domain': 'soundspan.sawdoctor.uk', 'proxyId': 27, 'certificateId': 68}
 
 
 def say(message):
@@ -104,6 +105,52 @@ def escaped(value):
     return value
 
 
+def retire_soundspan(db):
+    """Apply the user's explicit retirement only to an in-memory proposal."""
+    row = db.execute('SELECT domain_names,forward_scheme,forward_host,forward_port,certificate_id,is_deleted,enabled '
+                     'FROM proxy_host WHERE id=27').fetchone()
+    if (not row or json.loads(row[0]) != [RETIRED['domain']]
+            or row[1:] != ('http', '192.168.0.29', 3030, 68, 0, 1)):
+        raise RuntimeError('The reviewed Soundspan route differs; retirement was not applied.')
+    cert = db.execute('SELECT domain_names,provider,is_deleted FROM certificate WHERE id=68').fetchone()
+    if not cert or json.loads(cert[0]) != [RETIRED['domain']] or cert[1:] != ('letsencrypt', 0):
+        raise RuntimeError('The reviewed Soundspan certificate differs; retirement was not applied.')
+    # Also detect disabled references and any additional table using this cert.
+    for (table,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+        quoted = '"' + table.replace('"', '""') + '"'
+        columns = {r[1] for r in db.execute('PRAGMA table_info(' + quoted + ')')}
+        if 'certificate_id' not in columns:
+            continue
+        where = 'certificate_id=68'
+        if 'is_deleted' in columns:
+            where += ' AND is_deleted=0'
+        if table == 'proxy_host':
+            where += ' AND id<>27'
+        if db.execute('SELECT count(*) FROM ' + quoted + ' WHERE ' + where).fetchone()[0]:
+            raise RuntimeError('Soundspan certificate 68 is shared; other routes were retained.')
+    db.execute('UPDATE proxy_host SET is_deleted=1,enabled=0 WHERE id=27')
+    db.execute('UPDATE certificate SET is_deleted=1 WHERE id=68')
+    db.commit()
+
+
+def retire_copied_files(payload):
+    # The original immutable snapshot is untouched. Retire generated config and
+    # the exclusive certificate lineage only inside this temporary offline copy.
+    for relative in ('data/nginx/proxy_host/27.conf', 'data/nginx/proxy_host/27.conf.err',
+                     'letsencrypt/renewal/npm-68.conf'):
+        path = payload / relative
+        if path.is_symlink() or path.exists():
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError('An unexpected Soundspan configuration path needs review.')
+            path.unlink()
+    for relative in ('letsencrypt/live/npm-68', 'letsencrypt/archive/npm-68'):
+        path = payload / relative
+        if path.is_symlink() or path.exists():
+            if path.is_symlink() or not path.is_dir():
+                raise RuntimeError('An unexpected Soundspan certificate path needs review.')
+            shutil.rmtree(path)
+
+
 def certificate_checks(data, certs):
     with contextlib.closing(sqlite3.connect((data / 'database.sqlite').as_uri() + '?mode=ro', uri=True)) as db:
         ids = {r[0] for r in db.execute('SELECT certificate_id FROM proxy_host WHERE is_deleted=0 AND enabled=1') if r[0]}
@@ -182,7 +229,7 @@ def prepare(routes, restore):
             raise RuntimeError('A container references the candidate tree; it was retained.')
         routes.no_links(root)
         expected = {'format': FORMAT, 'sourceSnapshot': stamp, 'sourceDatabaseSha256': source_sha,
-                    'proposalDatabaseSha256': digest(proposal_bytes)}
+                    'proposalDatabaseSha256': digest(proposal_bytes), 'retiredService': RETIRED}
         stored, host_path, model = live_stack(routes, restore, current)
         env_sha = digest(json.dumps(stored['env'], sort_keys=True).encode())
         if root.exists():
@@ -215,6 +262,15 @@ def prepare(routes, restore):
             with contextlib.closing(sqlite3.connect(source_db.as_uri() + '?mode=ro', uri=True)) as original, \
                  contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as proposed:
                 routes.compare_all(original, proposed, changes)
+            with contextlib.closing(sqlite3.connect(':memory:')) as adjusted:
+                with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as proposed:
+                    proposed.backup(adjusted)
+                retire_soundspan(adjusted)
+                with contextlib.closing(sqlite3.connect(database)) as retired:
+                    adjusted.backup(retired)
+                    routes.compare_all(adjusted, retired, [])
+            os.utime(database, ns=(before.st_atime_ns, before.st_mtime_ns))
+            retire_copied_files(copied)
             counts = restore.database_report(database, copied / 'letsencrypt')
             keys = json.loads(routes.read(copied / 'data/keys.json', 256 * 1024))
             if not isinstance(keys, dict) or not keys:
@@ -249,6 +305,7 @@ def prepare(routes, restore):
             staged.rename(root)
         say('COMPLETE NAS NPM RESTORE PREPARED OFFLINE: ' + json.dumps(counts, sort_keys=True))
         say('Copied ' + str(total) + ' bytes; 21 upstream changes retained; TLS key-pair checks: ' + str(checked_certificates) + '.')
+        say('Soundspan route 27 and its exclusive certificate 68 retired from this offline copy; five other OptiPlex routes retained.')
         say('Source signing keys, accounts, access lists and custom files are retained privately.')
         say('Candidate definition: ' + str(root / 'ready.yaml'))
         say('No proxy/container restart, certificate renewal, router change or application stop was started.')
