@@ -1,5 +1,6 @@
 import contextlib
 import copy
+from datetime import datetime, timezone
 import importlib.util
 import json
 import os
@@ -10,6 +11,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import yaml
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.x509.oid import NameOID
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / 'scripts'
@@ -26,6 +30,17 @@ def load(name, path):
 
 module = load('complete_npm', SCRIPTS / 'prepare-nas-npm-cutover.py')
 fixture = load('npm_route_fixtures', Path(__file__).with_name('test_npm_routes_prepare.py'))
+
+
+def expired_certificate(key_file, output):
+    key = serialization.load_pem_private_key(key_file.read_bytes(), password=None)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'soundspan.sawdoctor.uk')])
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(68)
+            .not_valid_before(datetime(2020, 1, 1, tzinfo=timezone.utc))
+            .not_valid_after(datetime(2020, 2, 1, tzinfo=timezone.utc))
+            .sign(key, hashes.SHA256()))
+    output.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
 
 class CompleteNpmTests(unittest.TestCase):
@@ -59,6 +74,24 @@ class CompleteNpmTests(unittest.TestCase):
         (live / 'fullchain.pem').symlink_to('../../archive/npm-6/fullchain1.pem')
         with contextlib.closing(sqlite3.connect(self.case.path)) as db, db:
             db.execute("ALTER TABLE certificate ADD COLUMN provider TEXT DEFAULT 'letsencrypt'")
+            db.execute("ALTER TABLE certificate ADD COLUMN domain_names TEXT")
+            db.execute("INSERT INTO certificate(id,is_deleted,private_value,provider,domain_names) VALUES(68,0,'PRIVATE_RETIRED_CERT','letsencrypt',?)",
+                       (json.dumps(['soundspan.sawdoctor.uk']),))
+            db.execute('UPDATE proxy_host SET certificate_id=68 WHERE id=27')
+        retired_archive = self.certs / 'archive/npm-68'
+        retired_live = self.certs / 'live/npm-68'
+        retired_archive.mkdir()
+        retired_live.mkdir()
+        (retired_archive / 'privkey1.pem').write_bytes(self.key.read_bytes())
+        expired_certificate(self.key, retired_archive / 'fullchain1.pem')
+        for kind in ('fullchain', 'privkey'):
+            (retired_live / (kind + '.pem')).symlink_to('../../archive/npm-68/' + kind + '1.pem')
+        (self.certs / 'renewal').mkdir()
+        (self.certs / 'renewal/npm-68.conf').write_text('PRIVATE_RETIRED_RENEWAL')
+        generated = self.data / 'nginx/proxy_host'
+        generated.mkdir(parents=True)
+        (generated / '27.conf').write_text('server_name soundspan.sawdoctor.uk;')
+        (generated / '1.conf').write_text('PRIVATE_OTHER_ROUTE')
         self.checksums()
         self.r.stage()
         self.cache = self.case.root / 'image-identities.json'
@@ -150,6 +183,16 @@ class CompleteNpmTests(unittest.TestCase):
         self.assertEqual(record['changedUpstreams'], 21)
         self.assertEqual(record['checkedCertificateKeyPairs'], 1)
         self.assertEqual(record['status'], 'complete-offline-not-activated')
+        self.assertEqual(record['retiredService'], module.RETIRED)
+        self.assertEqual(record['counts']['proxy_host'], 29)
+        with contextlib.closing(sqlite3.connect(data / 'database.sqlite')) as db:
+            self.assertEqual(db.execute('SELECT is_deleted,enabled FROM proxy_host WHERE id=27').fetchone(), (1, 0))
+            self.assertEqual(db.execute('SELECT is_deleted FROM certificate WHERE id=68').fetchone(), (1,))
+        self.assertFalse((data / 'nginx/proxy_host/27.conf').exists())
+        self.assertEqual((data / 'nginx/proxy_host/1.conf').read_text(), 'PRIVATE_OTHER_ROUTE')
+        for suffix in ('live/npm-68', 'archive/npm-68', 'renewal/npm-68.conf'):
+            self.assertFalse((self.root / 'payload/letsencrypt' / suffix).exists())
+            self.assertTrue((self.certs / suffix).exists())
         self.assertNotIn('PRIVATE_', self.case.output.getvalue())
         for call in self.calls:
             self.assertNotIn('stop', call)
@@ -173,6 +216,32 @@ class CompleteNpmTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'certificate and private key do not match'):
             module.prepare(self.r, self.n)
         self.assertFalse(self.root.exists())
+
+    def test_another_expired_certificate_still_blocks_preparation(self):
+        expired_certificate(self.key, self.certificate)
+        self.checksums()
+        with self.assertRaisesRegex(RuntimeError, 'record 6 failed expiry/read validation'):
+            module.prepare(self.r, self.n)
+        self.assertFalse(self.root.exists())
+
+    def test_shared_soundspan_certificate_is_not_removed(self):
+        with contextlib.closing(sqlite3.connect(self.case.path)) as db, db:
+            db.execute('UPDATE proxy_host SET certificate_id=68,enabled=0 WHERE id=28')
+        # Preserve the accepted upstream fixture, then exercise the exact
+        # retirement guard directly: disabled routes still count as consumers.
+        with contextlib.closing(sqlite3.connect(self.case.path)) as db:
+            with self.assertRaisesRegex(RuntimeError, 'certificate 68 is shared'):
+                module.retire_soundspan(db)
+            self.assertEqual(db.execute('SELECT is_deleted FROM certificate WHERE id=68').fetchone(), (0,))
+            self.assertEqual(db.execute('SELECT is_deleted FROM proxy_host WHERE id=27').fetchone(), (0,))
+
+    def test_changed_soundspan_identity_is_not_retired(self):
+        with contextlib.closing(sqlite3.connect(self.case.path)) as db, db:
+            db.execute('UPDATE certificate SET domain_names=? WHERE id=68', ('["other.invalid"]',))
+        with contextlib.closing(sqlite3.connect(self.case.path)) as db:
+            with self.assertRaisesRegex(RuntimeError, 'Soundspan certificate differs'):
+                module.retire_soundspan(db)
+            self.assertEqual(db.execute('SELECT is_deleted FROM proxy_host WHERE id=27').fetchone(), (0,))
 
     def test_compose_value_change_fails_before_publication(self):
         self.changed_roundtrip = True
