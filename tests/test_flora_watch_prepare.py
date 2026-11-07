@@ -148,6 +148,17 @@ class FloraTests(unittest.TestCase):
         self.assertFalse(self.helper.exists())
         self.assertFalse(self.data.exists())
 
+    def test_missing_executable_is_named_before_any_install(self):
+        original = self.query
+        def query(*args, **kwargs):
+            if args == ('/usr/bin/which', 'sqlite3'):
+                raise RuntimeError('not found')
+            return original(*args, **kwargs)
+        with patch.object(s, 'run', side_effect=query), self.assertRaisesRegex(RuntimeError, 'needs the sqlite3 command'):
+            s.prepare(CODE)
+        self.assertFalse(self.helper.exists())
+        self.assertFalse(self.data.exists())
+
     def test_running_dependencies_and_paused_units_are_required(self):
         self.running = False
         with self.assertRaisesRegex(RuntimeError, 'dependencies'):
