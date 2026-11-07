@@ -31,10 +31,11 @@ RETRY_BEFORE_SHA = 'a0e6ee669db6c2afe82b1016fb7447edb0c4fc8e4a6ff7151b351a3c0b8a
 RETRY_AFTER_SHA = '0edbec73a149d1875401e3a6d3bf0be659bf8a08836b05f692cde08c033217e3'
 RETRY_ANCHOR = ('ssd=' + str(OLD_VOLUME) + '\nmountpoint -q "$ssd"\nroot="$ssd/backups/sets"\n').encode()
 RETRY_NEW = ('backup_volume=' + str(NEW_VOLUME) + '\nmountpoint -q "$backup_volume"\nroot="$backup_volume/backups/sets"\n').encode()
-FORMAT = 'sawdoctor-normal-backup-disk-move-v1'
+FORMAT = 'sawdoctor-normal-backup-disk-move-v2'
 UNIT = 'nas-backup-disk-move'
 MARKER = b'Sawdoctor NAS backup v1\n'
-PHASES = {'copying', 'activating', 'activated', 'removing-old-payload', 'complete'}
+PHASES = {'copying', 'merging', 'merged', 'removing-old-payload', 'complete'}
+GUIDES = {'omvbackup/RESTORE-README.txt', 'omvbackup/omv-restore-helper'}
 
 
 def say(value):
@@ -154,19 +155,6 @@ def load_state():
     return record
 
 
-def empty_directory_tree(path):
-    return all(not child.is_symlink() and child.is_dir() and empty_directory_tree(child)
-               for child in path.iterdir())
-
-
-def remove_empty_children(path):
-    for child in path.iterdir():
-        if child.is_symlink() or not child.is_dir():
-            raise RuntimeError('The new backup folder acquired files during activation; source retained.')
-        remove_empty_children(child)
-        child.rmdir()
-
-
 def preflight():
     mount_check(OLD_VOLUME, OLD_UUID, '557S10A2T9UW')
     mount_check(NEW_VOLUME, NEW_UUID, '26060336624000699')
@@ -188,8 +176,6 @@ def preflight():
             raise RuntimeError('The upload-retry helper ownership/type differs.')
         proposed = retry_patch(RETRY.read_bytes())
     state = load_state()
-    if not empty_directory_tree(TARGET) and (not state or state['phase'] == 'copying'):
-        raise RuntimeError('The new backup folder is nonempty; existing destination files were retained.')
     no_links(STAGING)
     if STAGING.exists() and (not state or not STAGING.is_dir()
                             or STAGING.stat().st_uid != 0
@@ -294,10 +280,105 @@ def verify_backup_sets(root, manifest):
                 raise RuntimeError('A retained backup failed its original SHA256 checksum list.')
         if not {'applications.tar.zst', 'RESTORE.txt', 'backup-script'}.issubset(names):
             raise RuntimeError('A retained backup lacks required recovery checksums.')
+        files = {path[len(prefix):] for path, row in manifest.items()
+                 if path.startswith(prefix) and row['kind'] == 'file'
+                 and path[len(prefix):] not in {'SHA256SUMS', '_COMPLETE', '_UPLOADED'}}
+        if names != files:
+            raise RuntimeError('A retained backup has files outside its original checksum list.')
         count += 1
     if not count:
         raise RuntimeError('No completed normal NAS backup sets were found.')
     return count
+
+
+def merge_plan(original, existing):
+    """Shared directories keep their destination metadata; never overwrite files."""
+    shared = []
+    skipped = []
+    source_sets = sorted(path for path in original if re.fullmatch(r'sets/nas-[0-9]{8}T[0-9]{6}Z', path))
+    target_sets = sorted(path for path in existing if re.fullmatch(r'sets/nas-[0-9]{8}T[0-9]{6}Z', path))
+    for path in sorted(set(original) & set(existing)):
+        before, current = original[path], existing[path]
+        if before['kind'] == current['kind'] == 'directory':
+            shared.append(path)
+            continue
+        # The plugin replaces these two small guides every night. Each old
+        # version must also exist in a checksum-verified, retained backup set.
+        if (path in GUIDES and source_sets and target_sets and target_sets[-1] > source_sets[-1]
+                and before['kind'] == current['kind'] == 'file'
+                and max(before['size'], current['size']) <= 1024**2):
+            name = Path(path).name
+            old_saved = original.get(source_sets[-1] + '/omv/' + name, {})
+            new_saved = existing.get(target_sets[-1] + '/omv/' + name, {})
+            if (old_saved.get('sha256') == before['sha256']
+                    and new_saved.get('sha256') == current['sha256']):
+                skipped.append(path)
+                continue
+        raise RuntimeError('A backup filename collision needs review; neither copy was overwritten: ' + path)
+    return {'sharedDirectories': shared, 'preservedCurrentGuides': skipped}
+
+
+def projection(records, paths, shared=()):
+    """Compare hard-link partitions independently of other sets' sort order."""
+    groups = {}
+    result = {}
+    for path in sorted(paths):
+        if path not in records:
+            raise RuntimeError('A required merged backup entry is missing; source retained.')
+        row = dict(records[path])
+        row.pop('ctime', None)
+        if row['kind'] == 'file':
+            row['group'] = groups.setdefault(row['group'], path)
+        if row['kind'] == 'directory' and path in shared:
+            row.pop('mtime', None)
+        result[path] = row
+    return result
+
+
+def verify_merged(original, existing, plan, merged):
+    if set(merged) != set(original) | set(existing):
+        raise RuntimeError('The merged destination has unexpected or missing entries; source retained.')
+    shared = set(plan['sharedDirectories'])
+    added = set(original) - shared - set(plan['preservedCurrentGuides'])
+    if projection(original, added) != projection(merged, added):
+        raise RuntimeError('Merged original checksums, metadata or hard links differ; source retained.')
+    if projection(existing, set(existing), shared) != projection(merged, set(existing), shared):
+        raise RuntimeError('Existing destination backups changed during merging; source retained.')
+
+
+def merge_payload(payload, original, existing, plan):
+    """Install absent names using exclusive links; resumes never replace data."""
+    say('Merging verified older files without replacing existing destination backups...')
+    for path, row in sorted(original.items(), key=lambda item: (item[0].count('/'), item[0])):
+        if path == '.' or path in existing:
+            continue
+        target = TARGET / path
+        no_links(target.parent)
+        staged = payload / path
+        if row['kind'] == 'directory':
+            if not target.exists():
+                target.mkdir(mode=0o700)  # fails rather than replacing a concurrent entry
+            if target.is_symlink() or not target.is_dir():
+                raise RuntimeError('A merge directory collision was retained for review.')
+            continue
+        if os.path.lexists(staged):
+            if os.path.lexists(target):
+                a, b = staged.lstat(), target.lstat()
+                if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
+                    raise RuntimeError('A merge file collision was retained; no file was overwritten.')
+            else:
+                # Both names are on the FIKWOT filesystem. link() is exclusive
+                # and preserves hard links, xattrs, owners and symlink literals.
+                os.link(staged, target, follow_symlinks=False)
+            staged.unlink()
+        elif not os.path.lexists(target):
+            raise RuntimeError('A previously staged backup file is missing; source retained.')
+    for path, row in sorted(original.items(), key=lambda item: (-item[0].count('/'), item[0])):
+        if row['kind'] == 'directory' and path not in existing:
+            target, staged = TARGET / path, payload / path
+            os.chown(target, row['uid'], row['gid'])
+            shutil.copystat(staged, target, follow_symlinks=False)
+            os.utime(target, ns=(staged.stat().st_atime_ns, row['mtime']))
 
 
 def record(phase, **extra):
@@ -386,51 +467,60 @@ def transfer_locked():
             raise RuntimeError('The completed transfer backup directory is unavailable.')
         say('The normal NAS backup relocation is already complete.')
         return
+    manifest_path = WORK / 'manifest.json'
     if state:
-        manifest_path = WORK / 'manifest.json'
         no_links(manifest_path)
         if not manifest_path.is_file() or manifest_path.stat().st_size > 64 * 1024**2:
             raise RuntimeError('The saved transfer manifest is unavailable or too large.')
-        original = json.loads(manifest_path.read_text())
+        saved = json.loads(manifest_path.read_text())
+        original, existing, plan = saved['source'], saved['destination'], saved['plan']
     else:
         say('Reading original backup checksums and file metadata; no new archive is created...')
         original = tree(SOURCE, label='Source SHA256 verification')
-        verify_backup_sets(SOURCE, original)
+        source_count = verify_backup_sets(SOURCE, original)
+        say('Verifying and preserving the backups already on the FIKWOT SSD...')
+        existing = tree(TARGET, label='Existing destination SHA256 verification')
+        target_count = (verify_backup_sets(TARGET, existing)
+                        if any(row['kind'] != 'directory' for row in existing.values()) else 0)
+        plan = merge_plan(original, existing)
         needed = int(run('du', '-sx', '-B1', str(SOURCE)).split()[0])
         if shutil.disk_usage(NEW_VOLUME).free < needed + 5 * 1024**3:
             raise RuntimeError('The backup SSD has insufficient verified-copy space.')
         WORK.mkdir(mode=0o700)
-        write_json(WORK / 'manifest.json', original)
-        record('copying', sourceAllocatedBytes=needed)
-    if not state or state['phase'] == 'copying' or (state['phase'] == 'activating' and empty_directory_tree(TARGET)):
+        write_json(manifest_path, {'source': original, 'destination': existing, 'plan': plan})
+        record('copying', sourceAllocatedBytes=needed, sourceBackupSets=source_count,
+               existingBackupSets=target_count)
+    if not state or state['phase'] == 'copying':
         if comparable(original, hashes=False) != comparable(tree(SOURCE, hashes=False), hashes=False):
             raise RuntimeError('The original backup tree changed before copying; source retained.')
+        if comparable(existing) != comparable(tree(TARGET)):
+            raise RuntimeError('The destination changed before copying; both copies were retained.')
         payload = copy_payload()
-        say('Verifying every copied regular file against its original SHA256 and comparing metadata/links...')
-        copied = tree(payload, label='Destination SHA256 verification')
+        say('Verifying every copied file against its original SHA256 and comparing metadata/links...')
+        copied = tree(payload, label='Copied SHA256 verification')
         verify_copy(original, copied)
         verify_backup_sets(payload, copied)
         if comparable(original, hashes=False) != comparable(tree(SOURCE, hashes=False), hashes=False):
             raise RuntimeError('The original backup tree changed during copying; source retained.')
-        destination()
-        if not empty_directory_tree(TARGET):
+        if comparable(existing) != comparable(tree(TARGET)):
             raise RuntimeError('The destination changed during copying; both copies were retained.')
-        os.chmod(payload, 0o700)
-        os.chown(payload, 0, TARGET.stat().st_gid)
-        record('activating')
-        no_nested_mounts(TARGET)
-        remove_empty_children(TARGET)
-        os.replace(payload, TARGET)
-        record('activated')
-        STAGING.rmdir()
+        destination()
+        record('merging')
+        phase = 'merging'
     else:
-        say('Rechecking the previously activated backup copy before finishing its cleanup...')
-        copied = tree(TARGET, label='Destination SHA256 recheck')
-        verify_copy(original, copied)
-        verify_backup_sets(TARGET, copied)
-        if STAGING.exists():
-            no_nested_mounts(STAGING)
-            shutil.rmtree(STAGING)
+        phase = state['phase']
+    if phase == 'merging':
+        payload = STAGING / 'payload'
+        no_links(payload)
+        no_nested_mounts(payload)
+        if not payload.is_dir():
+            raise RuntimeError('The owned staging tree is unavailable; source retained.')
+        merge_payload(payload, original, existing, plan)
+    say('Verifying the merged backups and proving the newer destination files were preserved...')
+    merged = tree(TARGET, label='Merged destination SHA256 verification')
+    verify_merged(original, existing, plan, merged)
+    count = verify_backup_sets(TARGET, merged)
+    record('merged')
     install_retry(proposed)
     preflight()
     say('Flushing the verified backup SSD before removing the old payload...')
@@ -446,10 +536,16 @@ def transfer_locked():
         else:
             shutil.rmtree(path)
     run('sync', '-f', str(SOURCE), timeout=300)
-    record('complete', verifiedBackupSets=verify_backup_sets(TARGET, copied),
-           oldBackupFolderRetainedEmpty=True, uploadRetryUpdated=proposed is not None)
+    if STAGING.exists():
+        no_nested_mounts(STAGING)
+        shutil.rmtree(STAGING)
+    record('complete', verifiedBackupSets=count, existingDestinationPreserved=True,
+           oldBackupFolderRetainedEmpty=True, uploadRetryUpdated=proposed is not None,
+           preservedCurrentGuides=plan['preservedCurrentGuides'])
     say('NAS NORMAL BACKUPS MOVED AND VERIFIED: ' + str(TARGET))
+    say('Existing destination backups and current recovery guides were preserved.')
     say('Old backup payload removed after checksum verification; its empty OMV folder is retained.')
+    say('Retained completed sets: ' + str(count) + '. The next successful normal backup applies the existing three-set retention.')
     say('Applications, GDrive uploads, retention, timers and standby snapshots were retained.')
     say('Small operation record: ' + str(WORK / 'result.json'))
 
