@@ -38,6 +38,7 @@ FORMAT = 'sawdoctor-nas-standby-disk-move-v1'
 SNAPSHOT_FORMAT = 'sawdoctor-migration-standby-v1'
 UNIT = 'nas-standby-disk-move'
 PHASES = {'copying', 'activating', 'activated', 'configured', 'removing-old-payload', 'complete'}
+MAX_CHECKSUM_LINE = 64 * 1024
 
 
 def say(value):
@@ -126,6 +127,52 @@ def small_json(e, path, limit=16 * 1024**2):
     return json.loads(path.read_text())
 
 
+def verify_checksum_list(e, checks, prefix, manifest):
+    """Stream a list bounded by its inventoried members, not arbitrary file size."""
+    e.no_links(checks)
+    expected = manifest.get(prefix + 'SHA256SUMS', {})
+    if expected.get('kind') != 'file':
+        raise RuntimeError('A standby checksum list is not an inventoried regular file.')
+    descriptor = os.open(checks, os.O_RDONLY | os.O_NOFOLLOW)
+    names_checked = set()
+    digest = hashlib.sha256()
+    with os.fdopen(descriptor, 'rb') as source:
+        before = os.fstat(source.fileno())
+        if (not stat.S_ISREG(before.st_mode) or before.st_size != expected['size']
+                or before.st_mtime_ns != expected['mtime'] or before.st_ctime_ns != expected['ctime']):
+            raise RuntimeError('A standby checksum list changed since its inventory; source retained.')
+        say(checks.parent.name + ': streaming checksum list (' + str(before.st_size // 1024**2) + ' MiB)...')
+        while True:
+            raw = source.readline(MAX_CHECKSUM_LINE + 1)
+            if not raw:
+                break
+            if len(raw) > MAX_CHECKSUM_LINE:
+                raise RuntimeError('A standby checksum line exceeds the supported path length.')
+            digest.update(raw)
+            line = os.fsdecode(raw[:-1] if raw.endswith(b'\n') else raw)
+            match = re.fullmatch(r'([0-9a-f]{64}) [ *](\./[^\r\n]+)', line)
+            if not match:
+                raise RuntimeError('A standby checksum line needs review.')
+            path = PurePosixPath(match[2])
+            if path.is_absolute() or '..' in path.parts or str(path) in names_checked:
+                raise RuntimeError('An unsafe/repeated standby checksum path was retained.')
+            member = manifest.get(prefix + str(path), {})
+            if member.get('kind') != 'file' or member.get('sha256') != match[1]:
+                raise RuntimeError('A standby file failed its original checksum; both copies retained.')
+            # Every unique name must match the already-hashed file inventory,
+            # so the inventory itself bounds how many lines can be accepted.
+            names_checked.add(str(path))
+        after = os.fstat(source.fileno())
+        if any(getattr(before, name) != getattr(after, name) for name in
+               ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
+            raise RuntimeError('A standby checksum list changed during verification; source retained.')
+    if digest.hexdigest() != expected['sha256']:
+        raise RuntimeError('The standby checksum list digest differs from its original inventory.')
+    if 'manifest.json' not in names_checked:
+        raise RuntimeError('A standby checksum list lacks its required source manifest.')
+    return len(names_checked)
+
+
 def verify_snapshots(e, root, manifest):
     snapshots = root / 'snapshots'
     if manifest.get('snapshots', {}).get('kind') != 'directory':
@@ -144,25 +191,7 @@ def verify_snapshots(e, root, manifest):
                 or source.get('sourceHost') != '192.168.0.29' or source.get('createdUtc') != folder.name):
             raise RuntimeError('A retained standby identity/verification record differs.')
         checks = folder / 'SHA256SUMS'
-        e.no_links(checks)
-        if manifest.get(prefix + 'SHA256SUMS', {}).get('kind') != 'file' or checks.stat().st_size > 16 * 1024**2:
-            raise RuntimeError('A standby checksum list is unavailable or too large.')
-        names_checked = set()
-        for line in checks.read_text().splitlines():
-            match = re.fullmatch(r'([0-9a-f]{64}) [ *](\./[^\r\n]+)', line)
-            if not match:
-                raise RuntimeError('A standby checksum line needs review.')
-            path = PurePosixPath(match[2])
-            if path.is_absolute() or '..' in path.parts or str(path) in names_checked:
-                raise RuntimeError('An unsafe/repeated standby checksum path was retained.')
-            names_checked.add(str(path))
-            if manifest.get(prefix + str(path), {}).get('sha256') != match[1]:
-                raise RuntimeError('A standby file failed its original checksum; both copies retained.')
-        files = {name[len(prefix):] for name, row in manifest.items()
-                 if name.startswith(prefix) and row['kind'] == 'file'
-                 and name[len(prefix):] not in {'SHA256SUMS', '_VERIFIED.json'}}
-        if not names_checked <= files or 'manifest.json' not in names_checked:
-            raise RuntimeError('A standby checksum member or required manifest is missing.')
+        verify_checksum_list(e, checks, prefix, manifest)
         names.append(folder.name)
         if manifest.get(prefix + 'data/plex-config', {}).get('kind') == 'directory':
             full.append(folder.name)
