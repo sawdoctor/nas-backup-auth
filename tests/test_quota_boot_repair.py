@@ -1,4 +1,6 @@
+import ast
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -61,7 +63,7 @@ class CheckerTests(unittest.TestCase):
                 self.assertEqual(self.call(self.results(user, group), main=True)[0], 0)
 
     def test_reported_nas_queries_return_two_with_both_quotas_on(self):
-        for path, device in zip(s.TARGETS, ('/dev/sda1', '/dev/nvme1n1p1')):
+        for path, device in zip(s.TARGETS, ('/dev/sda1', '/dev/nvme1n1p1', '/dev/sdb1'), strict=True):
             with self.subTest(path=path):
                 self.path = path
                 uuid = path.removeprefix('/srv/dev-disk-by-uuid-')
@@ -69,6 +71,17 @@ class CheckerTests(unittest.TestCase):
                           f'user quota on {path} ({device}) is on\n')
                 state, _ = self.call([completed(uuid + ' ext4\n'), completed(output, 2)])
                 self.assertEqual(state, {'user': 'on', 'group': 'on'})
+
+    def test_runtime_upgrade_only_extends_mount_whitelist(self):
+        self.assertEqual(hashlib.sha256(s.ORIGINAL_CHECKER_CODE.encode()).hexdigest(), s.ORIGINAL_CHECKER_SHA)
+        original = ast.parse(s.ORIGINAL_CHECKER_CODE)
+        updated = ast.parse(s.CHECKER_CODE)
+        old_targets = ast.literal_eval(original.body[6].value)
+        new_targets = ast.literal_eval(updated.body[6].value)
+        self.assertEqual(new_targets, (*old_targets, s.TARGETS[2]))
+        self.assertEqual(self.ns['TARGETS'], s.TARGETS)
+        original.body[6] = updated.body[6]
+        self.assertEqual(ast.dump(original), ast.dump(updated))
 
     def test_exit_status_must_equal_enabled_quota_count(self):
         for user, group in (('on', 'on'), ('on', 'off'), ('off', 'on'), ('off', 'off')):
@@ -174,14 +187,14 @@ class InstallerTests(unittest.TestCase):
                 self.assertFalse(s.expected_dropin({'DropInPaths': value}, destination))
         self.assertTrue(s.expected_dropin({'DropInPaths': ''}, destination, allow_absent=True))
 
-    def test_installs_only_two_conditions_and_keeps_vendor_command(self):
+    def test_installs_only_three_conditions_and_keeps_vendor_command(self):
         before = self.base.read_bytes()
         s.repair()
         self.assertEqual(self.base.read_bytes(), before)
         self.assertEqual(self.checker.read_text(), s.CHECKER_CODE)
         self.assertEqual(self.checker.stat().st_mode & 0o777, 0o700)
         files = list(self.system.glob('*.service.d/*.conf'))
-        self.assertEqual(len(files), 2)
+        self.assertEqual(len(files), 3)
         for path in files:
             self.assertEqual(path.read_bytes(), s.dropin())
             self.assertNotIn('ExecStart=', path.read_text())
@@ -222,7 +235,7 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(self.checker.exists())
         self.assertFalse(list(self.system.rglob('*.conf')))
 
-    def test_retry_keeps_the_existing_helper_and_two_dropins(self):
+    def test_retry_keeps_the_existing_helper_and_three_dropins(self):
         s.repair()
         paths = [self.checker, *self.system.glob('*.service.d/*.conf')]
         before = {str(path): (path.read_bytes(), path.stat().st_ino) for path in paths}
@@ -237,6 +250,65 @@ class InstallerTests(unittest.TestCase):
         with patch.object(Path, 'stat', root_owned_helper):
             s.repair()
         self.assertEqual(before, {str(path): (path.read_bytes(), path.stat().st_ino) for path in paths})
+        self.assertEqual(len(list(self.system.glob('*.service.d/*.conf'))), 3)
+
+    def prepare_original_install(self):
+        self.checker.parent.mkdir()
+        self.checker.write_text(s.ORIGINAL_CHECKER_CODE)
+        self.checker.chmod(0o700)
+        paths = []
+        for path in s.TARGETS[:2]:
+            unit = subprocess.check_output(['systemd-escape', '--path', '--template=quotaon@.service', path], text=True).strip()
+            dest = self.system / (unit + '.d') / s.DROPIN
+            dest.parent.mkdir()
+            dest.write_bytes(s.dropin())
+            paths.append(dest)
+        original_stat = Path.stat
+        def root_owned_helper(path, *args, **kwargs):
+            info = original_stat(path, *args, **kwargs)
+            if path == self.checker:
+                values = list(info)
+                values[4] = 0
+                return os.stat_result(values)
+            return info
+        self.patches.enter_context(patch.object(Path, 'stat', root_owned_helper))
+        return paths
+
+    def test_upgrades_original_helper_once_and_keeps_existing_two_overrides(self):
+        old_dropins = self.prepare_original_install()
+        original = {str(path): (path.read_bytes(), path.stat().st_ino) for path in old_dropins}
+        s.repair()
+        self.assertEqual(self.checker.read_text(), s.CHECKER_CODE)
+        self.assertEqual(original, {str(path): (path.read_bytes(), path.stat().st_ino) for path in old_dropins})
+        previous = self.work / 'checker.before-fikwot'
+        self.assertEqual(previous.read_text(), s.ORIGINAL_CHECKER_CODE)
+        paths = [self.checker, previous, *self.system.glob('*.service.d/*.conf')]
+        before_retry = {str(path): (path.read_bytes(), path.stat().st_ino) for path in paths}
+        s.repair()
+        self.assertEqual(before_retry, {str(path): (path.read_bytes(), path.stat().st_ino) for path in paths})
+        self.assertEqual(len(list(self.system.glob('*.service.d/*.conf'))), 3)
+        self.assertEqual(self.base.read_text(), TEMPLATE)
+        self.assertFalse(any('stop' in call or 'restart' in call or 'quotaoff' in call for call in self.calls))
+
+    def test_conflicting_recovery_copy_stops_before_upgrade(self):
+        self.prepare_original_install()
+        self.work.mkdir()
+        previous = self.work / 'checker.before-fikwot'
+        previous.write_text('retain this different copy')
+        with self.assertRaisesRegex(RuntimeError, 'recovery copy'):
+            s.repair()
+        self.assertEqual(self.checker.read_text(), s.ORIGINAL_CHECKER_CODE)
+        self.assertEqual(previous.read_text(), 'retain this different copy')
+        self.assertEqual(len(list(self.system.glob('*.service.d/*.conf'))), 2)
+
+    def test_third_mount_quota_failure_retains_original_install(self):
+        self.prepare_original_install()
+        def state(path):
+            return {'user': 'off' if path == s.TARGETS[2] else 'on', 'group': 'on'}
+        with patch.object(s, 'checker_namespace', return_value={'quota_state': state}), self.assertRaises(RuntimeError):
+            s.repair()
+        self.assertEqual(self.checker.read_text(), s.ORIGINAL_CHECKER_CODE)
+        self.assertFalse(self.work.exists())
         self.assertEqual(len(list(self.system.glob('*.service.d/*.conf'))), 2)
 
     def test_initial_off_quota_state_stops_before_install(self):
@@ -255,13 +327,13 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.checker.read_text(), 'keep existing helper')
         self.assertFalse(list(self.system.rglob('*.conf')))
 
-    def test_preflight_both_filesystems_before_first_write(self):
+    def test_preflight_all_three_filesystems_before_first_write(self):
         count = 0
         def feature(path):
             nonlocal count
             count += 1
-            if count == 2:
-                raise RuntimeError('second filesystem differs')
+            if count == 3:
+                raise RuntimeError('third filesystem differs')
         with patch.object(s, 'filesystem_check', side_effect=feature), self.assertRaises(RuntimeError):
             s.repair()
         self.assertFalse(self.checker.exists())
