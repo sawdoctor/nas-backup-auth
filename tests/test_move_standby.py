@@ -353,5 +353,17 @@ class StandbyTests(unittest.TestCase):
                 s.preflight(self.engine)
         self.assertFalse(self.work.exists())
 
+    def test_destination_detached_after_long_source_check_cannot_remove_old_payload(self):
+        seen = 0
+        def detached(volume, *args):
+            nonlocal seen
+            if volume == self.new:
+                seen += 1
+                if seen == 2: raise RuntimeError('destination detached')
+        with patch.object(self.engine, 'mount_check', side_effect=detached), self.assertRaisesRegex(RuntimeError, 'destination detached'):
+            self.transfer()
+        self.assertTrue((self.source / 'snapshots/20261104T003744Z').is_dir())
+        self.assertTrue((self.source / 'snapshots/20261107T003613Z').is_dir())
+
 
 if __name__ == '__main__': unittest.main()
