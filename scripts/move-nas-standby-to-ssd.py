@@ -366,6 +366,8 @@ def transfer_locked(e, stack):
     actual = e.tree(TARGET, label='Activated standby SHA256 verification')
     e.verify_copy(expected, actual)
     summary = verify_snapshots(e, TARGET, actual)
+    say('Flushing the verified snapshot location before changing its installed readers...')
+    e.run('sync', '-f', str(TARGET), timeout=300)
     for path, (original, proposed) in config.items():
         replace_control(e, path, original, proposed)
     e.run('systemctl', 'daemon-reload')
@@ -382,6 +384,14 @@ def transfer_locked(e, stack):
     e.run('sync', '-f', str(TARGET), timeout=300)
     remaining = e.tree(SOURCE, label='Final original standby SHA256 check')
     e.verify_remaining_source(saved, remaining)
+    # Recheck immediately before deletion, after the potentially long source
+    # checksum pass, so a detached/replaced destination cannot trigger cleanup.
+    e.mount_check(OLD_VOLUME, OLD_UUID, '557S10A2T9UW')
+    e.mount_check(NEW_VOLUME, NEW_UUID, '26060336624000699')
+    e.no_nested_mounts(TARGET)
+    if (e.comparable(expected, hashes=False, ignore_root=True)
+            != e.comparable(e.tree(TARGET, hashes=False), hashes=False, ignore_root=True)):
+        raise RuntimeError('The verified destination changed before cleanup; old snapshots retained.')
     e.no_nested_mounts(SOURCE)
     record(e, 'removing-old-payload')
     for path in list(SOURCE.iterdir()):
