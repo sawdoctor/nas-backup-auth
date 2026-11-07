@@ -260,7 +260,10 @@ def prepare(source_code):
         runtime, token = adapt(source, database)
         run('/usr/bin/bash', '-n', input=runtime.decode())
         for executable in ('sqlite3', 'curl', 'tee', 'date', 'cut', 'docker'):
-            run('/usr/bin/which', executable)
+            try:
+                run('/usr/bin/which', executable)
+            except RuntimeError:
+                raise RuntimeError('The NAS needs the ' + executable + ' command before this monitor can be staged.') from None
         summary = inspect_databases(database, kuma, token)
         files = {HELPER: (source_code, 0o700), DATA / 'original.sh': (source, 0o600), DATA / 'runtime.sh': (runtime, 0o700)}
         files.update({path: (data, 0o644) for path, data in unit_texts().items()})
