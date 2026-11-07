@@ -61,7 +61,8 @@ class TransferTests(unittest.TestCase):
         self.sums()
 
     def sums(self):
-        names = ['applications.tar.zst', 'RESTORE.txt', 'backup-script', 'omv/backup-omv-test.fsa']
+        names = sorted(str(path.relative_to(self.set)) for path in self.set.rglob('*')
+                       if path.is_file() and path.name not in {'SHA256SUMS', '_COMPLETE', '_UPLOADED'})
         (self.set / 'SHA256SUMS').write_text(''.join(
             s.sha((self.set / name).read_bytes()) + '  ./' + name + '\n' for name in names))
 
@@ -79,10 +80,11 @@ class TransferTests(unittest.TestCase):
 
     def test_real_copy_verifies_hardlinks_xattrs_and_literal_links_before_freeing_old_data(self):
         before = s.tree(self.source)
+        root_mode = stat.S_IMODE(self.target.stat().st_mode)
         self.transfer()
         self.assertEqual(list(self.source.iterdir()), [])
         self.assertTrue(self.source.is_dir())
-        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), root_mode)
         after = s.tree(self.target)
         s.verify_copy(before, after)
         self.assertEqual((self.target / 'literal-link').readlink(), Path('/mnt/nzbdav/.ids/never-read-video'))
@@ -102,11 +104,11 @@ class TransferTests(unittest.TestCase):
             self.transfer()
         self.assertTrue((self.target / 'sets/nas-20261106T020010Z/applications.tar.zst').is_file())
 
-    def test_plugin_created_empty_directories_are_allowed_and_replaced(self):
+    def test_plugin_created_empty_directories_are_allowed_and_preserved(self):
         (self.target / 'omvbackup/empty').mkdir(parents=True)
         self.transfer()
         self.assertTrue((self.target / 'omvbackup/backup-omv-test.fsa').is_file())
-        self.assertFalse((self.target / 'omvbackup/empty').exists())
+        self.assertTrue((self.target / 'omvbackup/empty').is_dir())
 
     def test_failed_destination_flush_retains_original_payload(self):
         original_run = s.run
@@ -119,16 +121,16 @@ class TransferTests(unittest.TestCase):
         self.assertTrue((self.set / 'applications.tar.zst').is_file())
         self.assertTrue((self.target / 'sets/nas-20261106T020010Z/applications.tar.zst').is_file())
 
-    def test_retry_recovers_interruption_immediately_after_atomic_activation(self):
+    def test_retry_recovers_interruption_immediately_after_merge(self):
         original_record = s.record
         def interrupted(phase, **extra):
-            if phase == 'activated':
-                raise RuntimeError('simulated interruption after atomic rename')
+            if phase == 'merged':
+                raise RuntimeError('simulated interruption after merge')
             original_record(phase, **extra)
         with patch.object(s, 'record', side_effect=interrupted), self.assertRaisesRegex(RuntimeError, 'simulated interruption'):
             self.transfer()
         self.assertTrue((self.set / 'applications.tar.zst').exists())
-        self.assertEqual(json.loads((self.work / 'result.json').read_text())['phase'], 'activating')
+        self.assertEqual(json.loads((self.work / 'result.json').read_text())['phase'], 'merging')
         with patch.object(s, 'copy_payload', side_effect=AssertionError('activated data must not be copied again')):
             self.transfer()
         self.assertEqual(list(self.source.iterdir()), [])
@@ -199,6 +201,137 @@ class TransferTests(unittest.TestCase):
             self.transfer()
         self.assertEqual((self.target / 'keep-existing').read_text(), 'different destination data')
         self.assertTrue((self.set / 'applications.tar.zst').is_file())
+
+    def target_fixture(self):
+        folder = self.target / 'sets/nas-20261107T020009Z'
+        (folder / 'omv').mkdir(parents=True)
+        (self.target / 'omvbackup').mkdir(exist_ok=True)
+        for name, value in [('applications.tar.zst', b'new application archive'),
+                            ('RESTORE.txt', b'new restore notes'), ('backup-script', b'current worker')]:
+            (folder / name).write_bytes(value)
+        os_file = self.target / 'omvbackup/backup-omv-new.fsa'
+        os_file.write_bytes(b'new OS image')
+        os.link(os_file, folder / 'omv/backup-omv-new.fsa')
+        for name in ('RESTORE-README.txt', 'omv-restore-helper'):
+            (self.source / 'omvbackup' / name).write_bytes(b'old ' + name.encode())
+            (self.set / 'omv' / name).write_bytes(b'old ' + name.encode())
+            (self.target / 'omvbackup' / name).write_bytes(b'new ' + name.encode())
+            (folder / 'omv' / name).write_bytes(b'new ' + name.encode())
+        self.sums()
+        names = sorted(str(path.relative_to(folder)) for path in folder.rglob('*') if path.is_file())
+        (folder / 'SHA256SUMS').write_text(''.join(
+            s.sha((folder / name).read_bytes()) + '  ./' + name + '\n' for name in names))
+        (folder / '_COMPLETE').write_bytes(s.MARKER)
+        (folder / '_UPLOADED').touch()
+        return folder
+
+    def test_nonempty_destination_preserves_new_set_guides_metadata_and_both_hardlink_groups(self):
+        newest = self.target_fixture()
+        original, existing = s.tree(self.source), s.tree(self.target)
+        expected = s.merge_plan(original, existing)
+        self.transfer()
+        merged = s.tree(self.target)
+        s.verify_merged(original, existing, expected, merged)
+        self.assertEqual(s.verify_backup_sets(self.target, merged), 2)
+        self.assertEqual(list(self.source.iterdir()), [])
+        self.assertEqual((self.target / 'omvbackup/RESTORE-README.txt').read_bytes(), b'new RESTORE-README.txt')
+        self.assertEqual((newest / 'applications.tar.zst').read_bytes(), b'new application archive')
+        self.assertEqual((self.target / 'omvbackup/backup-omv-new.fsa').stat().st_ino,
+                         (newest / 'omv/backup-omv-new.fsa').stat().st_ino)
+        self.assertEqual((self.target / 'omvbackup/backup-omv-test.fsa').stat().st_ino,
+                         (self.target / 'sets' / self.set.name / 'omv/backup-omv-test.fsa').stat().st_ino)
+        self.assertFalse(self.stage.exists())
+
+    def test_existing_filename_collision_stops_before_copy(self):
+        self.target_fixture()
+        (self.target / 'literal-link').write_bytes(b'keep destination data')
+        with patch.object(s, 'copy_payload') as copy, self.assertRaisesRegex(RuntimeError, 'filename collision'):
+            self.transfer()
+        copy.assert_not_called()
+        self.assertEqual((self.target / 'literal-link').read_bytes(), b'keep destination data')
+        self.assertTrue((self.set / 'applications.tar.zst').is_file())
+        self.assertFalse(self.work.exists())
+
+    def test_old_guide_without_retained_checksummed_version_is_not_discarded(self):
+        self.target_fixture()
+        (self.source / 'omvbackup/RESTORE-README.txt').write_bytes(b'unarchived old notes')
+        with self.assertRaisesRegex(RuntimeError, 'filename collision'):
+            self.transfer()
+        self.assertFalse(self.work.exists())
+
+    def test_new_guide_without_matching_new_set_is_preserved_and_stops_merge(self):
+        self.target_fixture()
+        (self.target / 'omvbackup/RESTORE-README.txt').write_bytes(b'unarchived new notes')
+        with self.assertRaisesRegex(RuntimeError, 'filename collision'):
+            self.transfer()
+        self.assertEqual((self.target / 'omvbackup/RESTORE-README.txt').read_bytes(), b'unarchived new notes')
+
+    def test_existing_backup_corruption_stops_before_copy(self):
+        newest = self.target_fixture()
+        (newest / 'applications.tar.zst').write_bytes(b'corrupted destination archive')
+        with patch.object(s, 'copy_payload') as copy, self.assertRaisesRegex(RuntimeError, 'original SHA256'):
+            self.transfer()
+        copy.assert_not_called()
+        self.assertTrue((self.set / 'applications.tar.zst').is_file())
+
+    def test_existing_destination_mutation_during_copy_is_retained(self):
+        newest = self.target_fixture()
+        original_copy = s.copy_payload
+        def mutate():
+            payload = original_copy()
+            (newest / 'RESTORE.txt').write_bytes(b'changed destination notes')
+            return payload
+        with patch.object(s, 'copy_payload', side_effect=mutate), self.assertRaisesRegex(RuntimeError, 'destination changed'):
+            self.transfer()
+        self.assertEqual((newest / 'RESTORE.txt').read_bytes(), b'changed destination notes')
+        self.assertTrue((self.set / 'applications.tar.zst').is_file())
+
+    def test_exclusive_link_never_overwrites_concurrent_destination_file(self):
+        original_link = os.link
+        def collide(src, dst, **kwargs):
+            if str(dst).endswith('applications.tar.zst'):
+                Path(dst).write_bytes(b'concurrent file')
+            return original_link(src, dst, **kwargs)
+        with patch.object(s.os, 'link', side_effect=collide), self.assertRaises(FileExistsError):
+            self.transfer()
+        self.assertEqual((self.target / 'sets' / self.set.name / 'applications.tar.zst').read_bytes(), b'concurrent file')
+        self.assertTrue((self.set / 'applications.tar.zst').is_file())
+
+    def test_resume_after_exclusive_link_before_staging_unlink(self):
+        self.target_fixture()
+        original_link = os.link
+        interrupted = False
+        def interrupt(src, dst, **kwargs):
+            nonlocal interrupted
+            result = original_link(src, dst, **kwargs)
+            if not interrupted:
+                interrupted = True
+                raise RuntimeError('interrupted after exclusive link')
+            return result
+        with patch.object(s.os, 'link', side_effect=interrupt), self.assertRaisesRegex(RuntimeError, 'after exclusive link'):
+            self.transfer()
+        self.assertEqual(json.loads((self.work / 'result.json').read_text())['phase'], 'merging')
+        self.transfer()
+        self.assertEqual(list(self.source.iterdir()), [])
+        self.assertEqual(s.verify_backup_sets(self.target, s.tree(self.target)), 2)
+
+    def test_merged_data_changed_before_resume_retains_old_source(self):
+        original_record = s.record
+        def interrupt(phase, **extra):
+            if phase == 'merged':
+                raise RuntimeError('interrupted merge')
+            original_record(phase, **extra)
+        with patch.object(s, 'record', side_effect=interrupt), self.assertRaisesRegex(RuntimeError, 'interrupted merge'):
+            self.transfer()
+        (self.target / 'sets' / self.set.name / 'applications.tar.zst').write_bytes(b'changed merged file')
+        with self.assertRaisesRegex(RuntimeError, 'Merged original'):
+            self.transfer()
+        self.assertTrue((self.set / 'applications.tar.zst').is_file())
+
+    def test_unlisted_file_inside_completed_set_is_rejected(self):
+        (self.set / 'unlisted').write_bytes(b'not covered by checksums')
+        with self.assertRaisesRegex(RuntimeError, 'outside its original checksum'):
+            self.transfer()
 
     def test_full_metadata_check_detects_broken_hardlinks(self):
         expected = s.tree(self.source)
@@ -282,7 +415,7 @@ class TransferTests(unittest.TestCase):
         with patch.object(s, 'run', return_value=value):
             s.destination()
 
-    def test_preflight_rejects_nonempty_target_and_modified_worker_without_writes(self):
+    def test_preflight_allows_nonempty_target_but_rejects_modified_worker_without_writes(self):
         original_stat = Path.stat
         def separate_ssd(path, *args, **kwargs):
             info = original_stat(path, *args, **kwargs)
@@ -294,8 +427,7 @@ class TransferTests(unittest.TestCase):
         with patch.object(s, 'mount_check'), patch.object(s, 'destination'), patch.object(Path, 'stat', separate_ssd):
             self.assertEqual(s.preflight(), (None, None))
             (self.target / 'keep').write_text('existing data')
-            with self.assertRaisesRegex(RuntimeError, 'nonempty'):
-                s.preflight()
+            self.assertEqual(s.preflight(), (None, None))
             (self.target / 'keep').unlink()
             self.backup.write_bytes(b'unreviewed backup change')
             with self.assertRaisesRegex(RuntimeError, 'backup worker differs'):
