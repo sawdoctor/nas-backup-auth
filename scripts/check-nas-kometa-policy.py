@@ -20,6 +20,8 @@ APP = Path('/srv/dev-disk-by-uuid-' + APP_UUID)
 BACKUP = Path('/srv/dev-disk-by-uuid-' + BACKUP_UUID)
 BASE = BACKUP / 'migration/nightly-standby'
 LIVE = APP / 'appdata/support-nas/kometa'
+IDENTITIES = APP / 'compose/support-nas/image-identities.json'
+SUPPORT = APP / 'migration/support-optiplex/snapshot'
 LOCK = Path('/run/lock/sawdoctor-nas-backup.lock')
 FILES = ('config.yml', 'uk-us-movies.yml', 'uk-us-movies4k.yml', 'uk-us-tv.yml')
 FORMAT = 'sawdoctor-migration-standby-v1'
@@ -28,6 +30,7 @@ FLAGS = {'add_missing', 'add_existing', 'radarr_add_missing', 'sonarr_add_missin
          'radarr_add_existing', 'sonarr_add_existing', 'radarr_monitor', 'sonarr_monitor',
          'radarr_search', 'sonarr_search', 'search', 'monitor'}
 CONNECTIONS = {'plex', 'radarr', 'sonarr', 'tmdb', 'trakt', 'tautulli', 'omdb', 'mdblist'}
+MONITOR_VALUES = {'all', 'future', 'missing', 'existing', 'pilot', 'first', 'latest', 'none'}
 
 
 def say(value):
@@ -189,6 +192,10 @@ def safe_filter(value):
     return '[structured filter value; inspect child policy fields]'
 
 
+def safe_file(value):
+    return value if isinstance(value, str) and re.fullmatch(r'(?:/?config/)?[A-Za-z0-9_.-]+\.ya?ml', value) else '[nonstandard file reference withheld]'
+
+
 def policy(document):
     result = []
     for path, value in walk(document):
@@ -196,11 +203,13 @@ def policy(document):
             continue
         key = path[-1].lower()
         if key in FLAGS:
-            result.append((label(path), value if type(value) is bool else '[not a literal boolean]'))
+            monitor = (key == 'sonarr_monitor' or key == 'monitor' and len(path) >= 2 and path[-2] == 'sonarr')
+            shown = value if type(value) is bool or monitor and isinstance(value, str) and value in MONITOR_VALUES else '[not a literal boolean]'
+            result.append((label(path), shown))
         elif re.search(r'country|language|region', key):
             result.append((label(path), safe_filter(value)))
         elif key == 'file':
-            result.append((label(path), value if isinstance(value, str) and re.fullmatch(r'(?:/config/)?[A-Za-z0-9_.-]+\.ya?ml', value) else '[nonstandard file reference withheld]'))
+            result.append((label(path), safe_file(value)))
         elif key == 'url' and len(path) >= 2 and path[-2] in CONNECTIONS:
             try:
                 url = urllib.parse.urlsplit(value)
@@ -239,6 +248,62 @@ def runtime_report(source, live):
     say('Container environment matches captured source: ' + json.dumps(environment(source_config) == environment(live_config)))
 
 
+def image_mapping_report(source, live):
+    record = json.loads(read(IDENTITIES)).get('kometa', {})
+    if any(not re.fullmatch(r'sha256:[a-f0-9]{64}', str(record.get(key, ''))) for key in ('source', 'nas', 'config')):
+        raise RuntimeError('The saved Kometa image mapping is unavailable or has an unexpected format.')
+    matches = record['source'] == source.get('Image') and record['nas'] == live.get('Image')
+    say('Saved migration mapping matches current source/NAS image IDs: ' + json.dumps(matches))
+    if not matches:
+        say('Image identity needs review against the recorded migration before activation.')
+        return
+    data = read(SUPPORT / 'manifest.json', 8 * 1024**2)
+    manifest = json.loads(data)
+    verify_selected(SUPPORT / 'SHA256SUMS', {'manifest.json': data})
+    if manifest.get('format') != 'sawdoctor-support-export-v1' or manifest.get('sourceHost') != '192.168.0.29':
+        raise RuntimeError('The saved support export identity differs.')
+    rows = [row for row in manifest.get('images', []) if row.get('Id') == record['source']]
+    if len(rows) != 1:
+        raise RuntimeError('The original Kometa image metadata is unavailable or duplicated.')
+    old = rows[0]
+    images = json.loads(run('docker', 'image', 'inspect', record['nas']))
+    if len(images) != 1:
+        raise RuntimeError('The loaded Kometa image metadata is unavailable or duplicated.')
+    new = images[0]
+    layers = old.get('RootFS', {}).get('Layers')
+    verified = (new.get('Id') == record['nas'] and old.get('Os') == new.get('Os') == 'linux'
+                and old.get('Architecture') == new.get('Architecture') == 'amd64'
+                and old.get('Variant', '') == new.get('Variant', '')
+                and isinstance(layers, list) and bool(layers) and layers == new.get('RootFS', {}).get('Layers'))
+    say('Loaded Kometa image layers/platform match verified original metadata: ' + json.dumps(verified))
+
+
+def collection_loading_report(config):
+    say('NAS collection-file loading entries (configured schedule; no run attempted):')
+    for path, value in walk(config):
+        if len(path) != 3 or path[0] != 'libraries' or path[2] != 'collection_files':
+            continue
+        if not isinstance(value, list):
+            say('  ' + label(path) + ': non-list form requires review.')
+            continue
+        for index, entry in enumerate(value):
+            prefix = '  ' + label((*path, str(index))) + ': '
+            if not isinstance(entry, dict):
+                say(prefix + 'non-mapping form requires review.')
+                continue
+            locations = []
+            for key in ('file', 'default', 'git', 'url', 'repo'):
+                if key not in entry:
+                    continue
+                item = entry[key]
+                shown = safe_file(item) if key == 'file' else item if key == 'default' and isinstance(item, str) and re.fullmatch(r'[A-Za-z0-9_/-]{1,100}', item) else '[external location withheld]'
+                locations.append(key + '=' + json.dumps(shown))
+            schedule = entry.get('schedule', 'daily (default)')
+            if not isinstance(schedule, str) or '://' in schedule or not re.fullmatch(r'[A-Za-z0-9_(),:/ .!+-]{1,120}', schedule):
+                schedule = '[nonstandard schedule withheld]'
+            say(prefix + ', '.join(locations) + '; schedule=' + schedule)
+
+
 def main():
     if os.geteuid() != 0 or 'inet 192.168.0.220/' not in run('ip', '-4', 'addr', 'show'):
         raise RuntimeError('Run with sudo on the NAS.')
@@ -261,7 +326,9 @@ def main():
         live = {name: read(LIVE / name) for name in FILES}
         say('Comparing four Kometa YAML files with the verified source standby: ' + stamp)
         runtime_report(source_container, row)
+        image_mapping_report(source_container, row)
         report(source, live)
+        collection_loading_report(parse(live['config.yml']))
         if live != {name: read(LIVE / name) for name in FILES}:
             raise RuntimeError('A live Kometa configuration changed during the report.')
     say('KOMETA POLICY REPORT COMPLETE. No Kometa run, API request, configuration write or service change was made.')
