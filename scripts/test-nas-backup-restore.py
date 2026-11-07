@@ -17,7 +17,8 @@ import sys
 import tarfile
 import tempfile
 
-SSD = Path('/srv/dev-disk-by-uuid-e5af079d-1bbd-4ad2-a94b-5a6dbaf8b4d6')
+BACKUP_UUID = '631e3391-6a42-4158-9aa4-f7718ba0e7e9'
+SSD = Path('/srv/dev-disk-by-uuid-' + BACKUP_UUID)
 SETS = SSD / 'backups/sets'
 WORK = SSD / 'backups/restore-check'
 LOCK = Path('/run/lock/sawdoctor-nas-backup.lock')
@@ -268,7 +269,11 @@ def guard():
         raise RestoreError('Run with sudo on the NAS.')
     addresses = subprocess.check_output(['ip', '-4', 'addr', 'show'], text=True, timeout=15)
     if 'inet 192.168.0.220/' not in addresses or not SSD.is_mount() or SSD.is_symlink():
-        raise RestoreError('The expected NAS and mounted application SSD are required.')
+        raise RestoreError('The expected NAS and mounted FIKWOT backup SSD are required.')
+    identity = subprocess.check_output(['findmnt', '-rn', '--mountpoint', str(SSD),
+                                        '-o', 'UUID,FSTYPE'], text=True, timeout=15).split()
+    if identity != [BACKUP_UUID, 'ext4']:
+        raise RestoreError('The backup SSD filesystem identity differs; no restore was started.')
     for program in ('zstd', 'rclone'):
         if not shutil.which(program):
             raise RestoreError('A required existing restore program is unavailable.')
