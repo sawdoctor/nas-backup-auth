@@ -365,5 +365,48 @@ class StandbyTests(unittest.TestCase):
         self.assertTrue((self.source / 'snapshots/20261104T003744Z').is_dir())
         self.assertTrue((self.source / 'snapshots/20261107T003613Z').is_dir())
 
+    def test_real_checksum_list_larger_than_16_mib_is_streamed_without_bulk_read(self):
+        path = self.root / 'large-SHA256SUMS'
+        prefix = 'snapshots/large/'
+        manifest = {prefix + 'manifest.json': {'kind': 'file', 'sha256': 'a' * 64}}
+        digest = __import__('hashlib').sha256()
+        with path.open('wb') as output:
+            line = ('a' * 64 + '  ./manifest.json\n').encode()
+            output.write(line); digest.update(line)
+            for number in range(90000):
+                name = 'data/' + str(number).zfill(6) + '-' + 'x' * 130
+                manifest[prefix + name] = {'kind': 'file', 'sha256': 'b' * 64}
+                line = ('b' * 64 + '  ./' + name + '\n').encode()
+                output.write(line); digest.update(line)
+        info = path.stat()
+        self.assertGreater(info.st_size, 16 * 1024**2)
+        manifest[prefix + 'SHA256SUMS'] = {'kind': 'file', 'size': info.st_size,
+            'mtime': info.st_mtime_ns, 'ctime': info.st_ctime_ns, 'sha256': digest.hexdigest()}
+        with patch.object(Path, 'read_text', side_effect=AssertionError('must stream list')), \
+                patch.object(Path, 'read_bytes', side_effect=AssertionError('must stream list')):
+            self.assertEqual(s.verify_checksum_list(self.engine, path, prefix, manifest), 90001)
+
+    def test_checksum_line_length_is_bounded_even_when_list_size_is_not(self):
+        folder = self.source / 'snapshots/20261107T003613Z'
+        (folder / 'SHA256SUMS').write_bytes(b'a' * (s.MAX_CHECKSUM_LINE + 1))
+        manifest = self.engine.tree(self.source)
+        with self.assertRaisesRegex(RuntimeError, 'supported path length'):
+            s.verify_checksum_list(self.engine, folder / 'SHA256SUMS', str(folder.relative_to(self.source)) + '/', manifest)
+
+    def test_checksum_list_itself_must_match_its_inventoried_digest(self):
+        folder = self.source / 'snapshots/20261107T003613Z'
+        manifest = self.engine.tree(self.source)
+        manifest['snapshots/20261107T003613Z/SHA256SUMS']['sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'checksum list digest differs'):
+            s.verify_checksum_list(self.engine, folder / 'SHA256SUMS', str(folder.relative_to(self.source)) + '/', manifest)
+
+    def test_checksum_list_changed_after_inventory_is_rejected(self):
+        folder = self.source / 'snapshots/20261107T003613Z'
+        manifest = self.engine.tree(self.source)
+        with (folder / 'SHA256SUMS').open('ab') as output:
+            output.write(b'changed after hashing\n')
+        with self.assertRaisesRegex(RuntimeError, 'changed since its inventory'):
+            s.verify_checksum_list(self.engine, folder / 'SHA256SUMS', str(folder.relative_to(self.source)) + '/', manifest)
+
 
 if __name__ == '__main__': unittest.main()
