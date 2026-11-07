@@ -174,11 +174,29 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(self.calls)
 
     def test_cloudflare_ranges_must_match_review(self):
-        with patch.object(s.urllib.request, 'urlopen', return_value=io.BytesIO(('\n'.join(s.CF)).encode())):
+        def response(ranges):
+            return io.BytesIO(json.dumps({'success': True, 'result': {'ipv4_cidrs': ranges}}).encode())
+        with patch.object(s.urllib.request, 'urlopen', return_value=response(list(s.CF))) as opener:
             self.assertEqual(s.cf_ranges(), s.CF)
-        for bad in ('0.0.0.0/0', '\n'.join((*s.CF, s.CF[0])), 'not a range'):
-            with self.subTest(bad=bad), patch.object(s.urllib.request, 'urlopen', return_value=io.BytesIO(bad.encode())):
+            self.assertEqual(opener.call_args.args[0], 'https://api.cloudflare.com/client/v4/ips')
+        for bad in (['0.0.0.0/0'], [*s.CF, s.CF[0]], ['not a range']):
+            with self.subTest(bad=bad), patch.object(s.urllib.request, 'urlopen', return_value=response(bad)):
                 with self.assertRaises((RuntimeError, ValueError)):
+                    s.cf_ranges()
+
+    def test_cloudflare_http_failure_names_status_without_changing_files(self):
+        error = s.urllib.error.HTTPError('https://api.cloudflare.com/client/v4/ips', 403, 'Forbidden', {}, None)
+        with patch.object(s.urllib.request, 'urlopen', side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, 'HTTP 403; no setup files were changed'):
+                s.cf_ranges()
+        self.assertFalse(self.action.exists())
+        self.assertFalse(self.config.exists())
+
+    def test_cloudflare_api_rejects_errors_and_malformed_lists(self):
+        for value in ([], {'success': False}, {'success': True, 'result': {}},
+                      {'success': True, 'result': {'ipv4_cidrs': '0.0.0.0/0'}}):
+            with self.subTest(value=value), patch.object(s.urllib.request, 'urlopen', return_value=io.BytesIO(json.dumps(value).encode())):
+                with self.assertRaises(RuntimeError):
                     s.cf_ranges()
 
     def test_changed_existing_config_is_rejected_by_preflight(self):
