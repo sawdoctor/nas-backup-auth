@@ -16,6 +16,10 @@ if not SCRIPTS.is_dir():
 spec = importlib.util.spec_from_file_location('kometa_policy_report', SCRIPTS / 'check-nas-kometa-policy.py')
 s = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(s)
+SOURCE_ID = 'sha256:' + 'a' * 64
+NAS_ID = 'sha256:' + 'b' * 64
+CONFIG_ID = 'sha256:' + 'c' * 64
+LAYERS = ['sha256:' + 'd' * 64]
 
 OLD = b'''plex:
   url: http://user:PRIVATE_URL_PASSWORD@192.168.0.29:32400/private?token=PRIVATE_QUERY
@@ -111,6 +115,30 @@ collections:
             s.parse(b'!!python/object/apply:os.system [echo unsafe]\n')
         command.assert_not_called()
 
+    def test_relative_file_references_and_sonarr_monitor_enum_are_displayed(self):
+        data = OLD.replace(b'/config/uk-us-movies.yml', b'config/uk-us-movies.yml') + b'sonarr: {monitor: all}\n'
+        output = self.output(data)
+        self.assertIn('config/uk-us-movies.yml', output)
+        self.assertNotIn('nonstandard file reference', output)
+        self.assertIn('sonarr.monitor: "all"', output)
+
+    def test_collection_loading_shows_defaults_references_and_never_schedule(self):
+        data = b'''libraries:
+  Movies:
+    collection_files:
+      - default: tautulli
+      - file: config/uk-us-movies.yml
+        schedule: never
+      - url: https://example.invalid/PRIVATE_URL
+        schedule: https://example.invalid/PRIVATE_SCHEDULE
+'''
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            s.collection_loading_report(s.parse(data))
+        self.assertIn('default="tautulli"', out.getvalue())
+        self.assertIn('file="config/uk-us-movies.yml"; schedule=never', out.getvalue())
+        self.assertNotIn('PRIVATE', out.getvalue())
+
 
 class SnapshotTests(unittest.TestCase):
     def setUp(self):
@@ -125,7 +153,7 @@ class SnapshotTests(unittest.TestCase):
         (self.snapshot / '_VERIFIED.json').write_text(json.dumps(self.current))
         manifest = {'format': s.FORMAT, 'scope': 'standby-only', 'sourceHost': '192.168.0.29',
                     'createdUtc': self.snapshot.name, 'dataRoots': {'support.kometa': {'snapshot': 'data/support.kometa'}},
-                    'containers': [{'Name': '/kometa', 'Image': 'sha256:fixture',
+                    'containers': [{'Name': '/kometa', 'Image': SOURCE_ID,
                                     'Config': {'Env': ['KOMETA_TOKEN=PRIVATE_RUNTIME_TOKEN'], 'Cmd': ['--config', '/config/config.yml']}}]}
         (self.snapshot / 'manifest.json').write_text(json.dumps(manifest))
         for name in s.FILES:
@@ -136,6 +164,19 @@ class SnapshotTests(unittest.TestCase):
         self.patches = contextlib.ExitStack()
         self.addCleanup(self.patches.close)
         self.patches.enter_context(patch.object(s, 'BASE', self.base))
+
+    def image_fixture(self):
+        identities = self.root / 'image-identities.json'
+        identities.write_text(json.dumps({'kometa': {'source': SOURCE_ID, 'nas': NAS_ID, 'config': CONFIG_ID}}))
+        support = self.root / 'support'
+        support.mkdir()
+        metadata = {'Id': SOURCE_ID, 'Os': 'linux', 'Architecture': 'amd64', 'RootFS': {'Layers': LAYERS}}
+        data = json.dumps({'format': 'sawdoctor-support-export-v1', 'sourceHost': '192.168.0.29', 'images': [metadata]}).encode()
+        (support / 'manifest.json').write_bytes(data)
+        (support / 'SHA256SUMS').write_text(hashlib.sha256(data).hexdigest() + '  ./manifest.json\n')
+        self.patches.enter_context(patch.object(s, 'IDENTITIES', identities))
+        self.patches.enter_context(patch.object(s, 'SUPPORT', support))
+        return {'Id': NAS_ID, 'Os': 'linux', 'Architecture': 'amd64', 'RootFS': {'Layers': LAYERS}}
 
     def test_checks_only_the_selected_files_and_retains_inputs(self):
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in self.snapshot.rglob('*') if path.is_file()}
@@ -189,6 +230,7 @@ class SnapshotTests(unittest.TestCase):
                     s.mount(self.root, s.APP_UUID)
 
     def test_full_read_only_report_does_not_change_files_or_execute_container(self):
+        image = self.image_fixture()
         live = self.root / 'live'
         live.mkdir()
         for name in s.FILES:
@@ -196,7 +238,7 @@ class SnapshotTests(unittest.TestCase):
         backup_lock = self.root / 'backup.lock'
         backup_lock.touch()
         (self.base / '.run.lock').touch()
-        row = {'Name': '/kometa-nas', 'Image': 'sha256:fixture',
+        row = {'Name': '/kometa-nas', 'Image': NAS_ID,
                'Config': {'Env': ['KOMETA_TOKEN=PRIVATE_RUNTIME_TOKEN'], 'Cmd': ['--config', '/config/config.yml']},
                'State': {'Status': 'created', 'Running': False},
                'HostConfig': {'RestartPolicy': {'Name': 'no'}},
@@ -208,6 +250,8 @@ class SnapshotTests(unittest.TestCase):
                 return 'inet 192.168.0.220/24'
             if args == ('docker', 'inspect', 'kometa-nas'):
                 return json.dumps([row])
+            if args == ('docker', 'image', 'inspect', NAS_ID):
+                return json.dumps([image])
             raise AssertionError(args)
         before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.root.rglob('*') if p.is_file()}
         out = io.StringIO()
@@ -215,10 +259,34 @@ class SnapshotTests(unittest.TestCase):
                 patch.object(s, 'mount'), patch.object(s, 'run', side_effect=query), contextlib.redirect_stdout(out):
             s.main()
         self.assertIn('REPORT COMPLETE', out.getvalue())
-        self.assertIn('image identity matches captured source: true', out.getvalue())
+        self.assertIn('image identity matches captured source: false', out.getvalue())
+        self.assertIn('Saved migration mapping matches current source/NAS image IDs: true', out.getvalue())
+        self.assertIn('image layers/platform match verified original metadata: true', out.getvalue())
         self.assertNotIn('PRIVATE', out.getvalue())
-        self.assertEqual(calls, [('ip', '-4', 'addr', 'show'), ('docker', 'inspect', 'kometa-nas')])
+        self.assertEqual(calls, [('ip', '-4', 'addr', 'show'), ('docker', 'inspect', 'kometa-nas'), ('docker', 'image', 'inspect', NAS_ID)])
         self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.root.rglob('*') if p.is_file()})
+
+    def test_mapped_image_layers_platform_and_source_changes_are_detected(self):
+        image = self.image_fixture()
+        for key, value in [('Os', 'other'), ('Architecture', 'arm64'), ('RootFS', {'Layers': ['different']})]:
+            changed = {**image, key: value}
+            out = io.StringIO()
+            with self.subTest(key=key), patch.object(s, 'run', return_value=json.dumps([changed])), contextlib.redirect_stdout(out):
+                s.image_mapping_report({'Image': SOURCE_ID}, {'Image': NAS_ID})
+            self.assertIn('metadata: false', out.getvalue())
+        out = io.StringIO()
+        with patch.object(s, 'run') as command, contextlib.redirect_stdout(out):
+            s.image_mapping_report({'Image': 'sha256:' + 'f' * 64}, {'Image': NAS_ID})
+        command.assert_not_called()
+        self.assertIn('image IDs: false', out.getvalue())
+
+    def test_saved_source_metadata_must_pass_original_checksum(self):
+        image = self.image_fixture()
+        path = s.SUPPORT / 'manifest.json'
+        path.write_bytes(path.read_bytes() + b'\n')
+        with patch.object(s, 'run') as command, contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'checksum'):
+            s.image_mapping_report({'Image': SOURCE_ID}, {'Image': NAS_ID})
+        command.assert_not_called()
 
     def test_runtime_differences_never_print_environment_or_arguments(self):
         source = {'Image': 'sha256:a', 'Config': {'Cmd': ['PRIVATE_OLD_ARGUMENT'], 'Env': ['TOKEN=PRIVATE_OLD_TOKEN']}}
