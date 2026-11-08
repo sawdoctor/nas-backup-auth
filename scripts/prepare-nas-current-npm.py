@@ -182,7 +182,43 @@ def validate_archive(archive):
     return total
 
 
-def validate_export(extracted, ready, source):
+def inventory_difference(expected, actual):
+    fields, details, xattrs = {}, [], {'added': {}, 'removed': {}, 'changed': {}}
+    deltas = []
+    before, after = expected.get('entries', {}), actual.get('entries', {})
+    safe_xattrs = {'system.posix_acl_access', 'system.posix_acl_default', 'security.selinux', 'security.capability'}
+    total = 0
+    for path in sorted(set(before) | set(after)):
+        old, new = before.get(path), after.get(path)
+        if old == new:
+            continue
+        total += 1
+        changed = ({'missing-entry': {'expected': old, 'actual': None}} if new is None else
+                   {'additional-entry': {'expected': None, 'actual': new}} if old is None else
+                   {key: {'expected': old.get(key), 'actual': new.get(key)} for key in sorted(set(old) | set(new))
+                    if old.get(key) != new.get(key)})
+        for key in changed:
+            fields[key] = fields.get(key, 0) + 1
+        if old is not None and new is not None:
+            if 'mtimeNs' in changed:
+                deltas.append(new['mtimeNs'] - old['mtimeNs'])
+            a, b = old.get('xattrs', {}), new.get('xattrs', {})
+            for key in set(a) | set(b):
+                if a.get(key) != b.get(key):
+                    group = 'added' if key not in a else 'removed' if key not in b else 'changed'
+                    safe = key if key in safe_xattrs else '[other xattr name withheld]'
+                    xattrs[group][safe] = xattrs[group].get(safe, 0) + 1
+        if len(details) < 500:
+            details.append({'path': path, 'differences': changed})
+    summary = {'differingEntries': total, 'differingFields': fields,
+               'sourceBytes': expected.get('bytes'), 'extractedBytes': actual.get('bytes'),
+               'xattrDifferences': xattrs}
+    if deltas:
+        summary['mtimeDeltaNsRange'] = [min(deltas), max(deltas)]
+    return summary, details
+
+
+def validate_export(extracted, ready, source, diagnostic_path=None):
     if (file_digest(extracted / 'manifest.json') != ready['manifestSha256']
             or file_digest(extracted / 'payload-inventory.json') != ready['inventorySha256']):
         raise RuntimeError('The received source NPM metadata failed its SHA256 checks.')
@@ -195,7 +231,16 @@ def validate_export(extracted, ready, source):
             or manifest.get('shelfmarkAudio', {}).get('certificateId') != 86):
         raise RuntimeError('The current NPM export differs from the reviewed source/retirement/certificate report.')
     payload = extracted / 'payload'
-    if source.inventory(payload) != expected or expected['bytes'] != ready['payloadBytes']:
+    actual = source.inventory(payload)
+    if actual != expected or expected['bytes'] != ready['payloadBytes']:
+        summary, details = inventory_difference(expected, actual)
+        say('NPM INVENTORY DIFFERENCE SUMMARY: ' + json.dumps(summary, sort_keys=True))
+        if diagnostic_path is not None:
+            report = {'format': 'sawdoctor-npm-inventory-diff-v1', 'archiveSha256': ready['archiveSha256'],
+                      'inventorySha256': ready['inventorySha256'], 'summary': summary, 'details': details,
+                      'detailLimit': 500, 'containsFileContents': False}
+            source.atomic(diagnostic_path, (json.dumps(report, indent=2) + '\n').encode(), 0o600)
+            say('Private metadata-only comparison: ' + str(diagnostic_path))
         raise RuntimeError('A received NPM file, permission, xattr, timestamp or link differs from its source inventory.')
     database = payload / 'data/database.sqlite'
     if file_digest(database) != manifest['databaseSha256'] or any(Path(str(database) + suffix).exists() for suffix in ('-wal', '-shm', '-journal')):
@@ -311,7 +356,7 @@ def prepare(source, complete, private, routes, restore):
             source.run('tar', '--acls', '--xattrs', '--xattrs-include=*', '--numeric-owner', '--delay-directory-restore',
                        '-xzpf', str(archive), '-C', str(extracted), timeout=180)
             say('Verifying source metadata, private files, certificate names and key pairs...')
-            manifest = validate_export(extracted, ready, source)
+            manifest = validate_export(extracted, ready, source, root.parent / 'current-inventory-diff.json')
             staged = work / 'candidate'; extracted.rename(staged)
             (staged / 'manifest.json').rename(staged / 'source-manifest.json')
             (staged / 'payload-inventory.json').rename(staged / 'source-inventory.json')
