@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+from urllib.parse import urlsplit
 
 APP = Path('/srv/dev-disk-by-uuid-e5af079d-1bbd-4ad2-a94b-5a6dbaf8b4d6')
 TARGETS = (
@@ -13,6 +14,15 @@ TARGETS = (
     ('Chaptarr', 'http://192.168.0.29:8789/', 'chaptarr.sawdoctor.uk'),
     ('Shelfmark Audio', 'http://192.168.0.220:8084/', 'shelfmark-audio.sawdoctor.uk'),
 )
+
+
+def safe_host(value):
+    if not value:
+        return None
+    try:
+        return urlsplit('//' + str(value)).hostname or '[hostname withheld]'
+    except ValueError:
+        return '[hostname withheld]'
 
 
 def show(*args, stdin=None, timeout=15):
@@ -48,11 +58,11 @@ def main():
                               'FROM proxy_host WHERE id IN (2,31,32) ORDER BY id'):
             locations = json.loads(row[5] or '[]')
             text = (row[6] or '') + (row[5] or '')
-            safe = {'id': row[0], 'domains': json.loads(row[1]), 'scheme': row[2], 'host': row[3], 'port': row[4],
+            safe = {'id': row[0], 'domains': json.loads(row[1]), 'scheme': row[2], 'host': safe_host(row[3]), 'port': row[4],
                     'customLocationCount': len(locations),
                     'customConfigReferences': [host for host in ('usenet-ultimate', '192.168.0.29', '192.168.0.220') if host in text]}
             safe['customLocations'] = [{'root': location.get('path') == '/', 'scheme': location.get('forward_scheme'),
-                                       'host': location.get('forward_host'), 'port': location.get('forward_port')}
+                                       'host': safe_host(location.get('forward_host')), 'port': location.get('forward_port')}
                                       for location in locations]
             print(json.dumps(safe), flush=True)
     print('\nCurrent NAS Usenet container:', flush=True)
@@ -71,7 +81,7 @@ Promise.all(targets.map(([name,url,host]) => new Promise(resolve => {
   let done=false;
   function finish(result) { if(done) return; done=true; clearTimeout(timer); resolve({name,...result}); }
   const request=http.get(url,{headers:{Host:host}},response => {
-    response.resume(); finish({http:response.statusCode});
+    finish({http:response.statusCode}); response.destroy();
   });
   const timer=setTimeout(() => { request.destroy(); finish({error:'TIMEOUT'}); },3000);
   request.on('error',error => finish({error:error.code || 'HTTP_ERROR'}));
