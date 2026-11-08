@@ -4,6 +4,7 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import ssl
@@ -58,7 +59,8 @@ if (calls!==0 || timers!==0) throw Error('Certificate side effect occurred');
                                {'type':'bind','source':'/immutable/certs','target':'/etc/letsencrypt'}],
                     'networks':{'default':None}}}, 'networks':{'default':{'name':'npm-nas_default'}}}
         before = copy.deepcopy(model)
-        current = {'Image':'sha256:verified', 'NetworkSettings':{'Networks':{'npm-nas_default':{}}}}
+        current = {'Image':'sha256:verified', 'NetworkSettings':{'Networks':{'npm-nas_default':{}}},
+                   'Config':{'Env':['PRIVATE=secret_$value'],'Labels':{}}}
         trial = s.trial_model(model, current, self.root, self.root / 'guard.js')
         self.assertEqual(model, before)
         service = trial['services']['npm']
@@ -104,6 +106,61 @@ if (calls!==0 || timers!==0) throw Error('Certificate side effect occurred');
             db.execute('UPDATE proxy_host SET domain_names=? WHERE id=1', ('["soundspan.sawdoctor.uk"]',))
         with self.assertRaisesRegex(RuntimeError, 'unexpected private-test route'):
             s.routes_in(path)
+
+
+class ComposeRoundTripTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name)
+        spec=importlib.util.spec_from_file_location('candidate_helpers',SCRIPTS/'prepare-nas-npm-cutover.py')
+        self.complete=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.complete)
+        self.model={'name':'npm-nas','services':{'npm':{'container_name':'npm-nas','image':'existing',
+            'environment':{'PRIVATE':'SECRET_$$value'},'labels':{'private-label':'LABEL_$$literal'},
+            'command':['sh','-c','echo $$value'],
+            'volumes':[{'type':'bind','source':'/original/data','target':'/data','bind':{'create_host_path':False}},
+                       {'type':'bind','source':'/original/certs','target':'/etc/letsencrypt','bind':{'create_host_path':False}}],
+            'networks':{'default':None}}},'networks':{'default':{'name':'npm-nas_default'}}}
+        self.current={'Image':'sha256:'+'a'*64,'NetworkSettings':{'Networks':{'npm-nas_default':{}}},
+            'Config':{'Env':['PRIVATE=SECRET_$value'],'Labels':{'private-label':'LABEL_$literal'},
+                      'Cmd':['sh','-c','echo $value']}}
+        self.wanted=s.trial_model(self.model,self.current,self.root,self.root/'guard.js')
+
+    def test_known_defaults_allowed_but_all_material_changes_rejected(self):
+        rendered=self.complete.escaped(self.wanted)
+        service=rendered['services']['npm']
+        service['entrypoint']=None
+        for mount in service['volumes']:
+            del mount['bind']['create_host_path']
+        rendered['networks']['default']['ipam']={}
+        s.validate_compose(self.wanted,rendered,self.complete.escaped)
+        variants=[]
+        for field,value in [('image','other-image'),('privileged',True),('command',['changed'])]:
+            item=copy.deepcopy(rendered);item['services']['npm'][field]=value;variants.append(item)
+        for field,value in [('host_ip','0.0.0.0'),('published','443')]:
+            item=copy.deepcopy(rendered);item['services']['npm']['ports'][0][field]=value;variants.append(item)
+        for field,value in [('read_only',False),('source','/production/certificate.js')]:
+            item=copy.deepcopy(rendered);item['services']['npm']['volumes'][2][field]=value;variants.append(item)
+        item=copy.deepcopy(rendered);item['services']['npm']['volumes'][0]['bind']['create_host_path']=True;variants.append(item)
+        item=copy.deepcopy(rendered);item['networks']['default']['external']=False;variants.append(item)
+        item=copy.deepcopy(rendered);item['services']['npm']['environment']['PRIVATE']='OTHER_SECRET';variants.append(item)
+        for item in variants:
+            with self.assertRaisesRegex(RuntimeError,'round trip differs') as error:
+                s.validate_compose(self.wanted,item,self.complete.escaped)
+            self.assertNotIn('SECRET',str(error.exception))
+
+    def test_native_compose_default_normalization_and_dollars(self):
+        binary=os.environ.get('NPM_COMPOSE_BINARY')
+        if not binary:
+            self.skipTest('Set NPM_COMPOSE_BINARY to run the native Compose parser regression.')
+        import yaml
+        path=self.root/'trial.yaml'
+        path.write_text(yaml.safe_dump(self.complete.escaped(self.wanted),sort_keys=False))
+        result=subprocess.run([binary,'-p','nas-npm-private-test','-f',str(path),'config','--format','json'],
+                              capture_output=True,text=True,check=True,timeout=25)
+        rendered=json.loads(result.stdout)
+        s.validate_compose(self.wanted,rendered,self.complete.escaped)
+        self.assertEqual(self.wanted['services']['npm']['environment']['PRIVATE'],'SECRET_$value')
+        self.assertEqual(rendered['services']['npm']['environment']['PRIVATE'],'SECRET_$$value')
 
 
 class StrictHttpsTests(unittest.TestCase):
