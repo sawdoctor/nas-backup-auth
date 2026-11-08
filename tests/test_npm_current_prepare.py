@@ -138,6 +138,35 @@ class CandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'certificate report'):
             s.validate_export(self.export,changed,source)
 
+    def test_metadata_diagnostic_preserves_strict_failure_and_keeps_private_paths_out_of_journal(self):
+        extracted=self.extract();private=extracted/'payload/data/custom'
+        private.chmod(0o600)
+        os.setxattr(private,'user.PRIVATE_ATTRIBUTE_NAME',b'PRIVATE_ATTRIBUTE_VALUE')
+        report=self.root/'diagnostic.json'
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with self.assertRaisesRegex(RuntimeError,'source inventory'):
+                s.validate_export(extracted,self.ready,source,report)
+        saved=json.loads(report.read_text())
+        self.assertEqual(saved['summary']['differingFields'],{'mode':1,'xattrs':1})
+        self.assertEqual(saved['summary']['sourceBytes'],saved['summary']['extractedBytes'])
+        self.assertEqual(saved['details'][0]['path'],'data/custom')
+        self.assertEqual(report.stat().st_mode & 0o777,0o600)
+        self.assertNotIn('PRIVATE_',output.getvalue())
+        self.assertNotIn('data/custom',output.getvalue())
+        self.assertNotIn('PRIVATE_CUSTOM_FILE',report.read_text())
+
+    def test_diagnostic_distinguishes_missing_files_content_and_timestamp_changes(self):
+        before={'bytes':3,'entries':{'PRIVATE_PATH':{'kind':'file','size':3,'sha256':'a','mtimeNs':100,'xattrs':{}},
+                                   'PRIVATE_MISSING':{'kind':'file','size':0}}}
+        after={'bytes':3,'entries':{'PRIVATE_PATH':{'kind':'file','size':3,'sha256':'b','mtimeNs':125,'xattrs':{}},
+                                   'PRIVATE_ADDED':{'kind':'file','size':0}}}
+        summary,details=s.inventory_difference(before,after)
+        self.assertEqual(summary['differingFields'],{'additional-entry':1,'missing-entry':1,'mtimeNs':1,'sha256':1})
+        self.assertEqual(summary['mtimeDeltaNsRange'],[25,25])
+        self.assertNotIn('PRIVATE_',json.dumps(summary))
+        self.assertEqual(len(details),3)
+
     def test_small_nonempty_archive_is_allowed_but_zero_stale_or_future_is_rejected(self):
         self.assertLess(self.ready['archiveBytes'],1024**2)
         s.validate_ready(self.ready)
