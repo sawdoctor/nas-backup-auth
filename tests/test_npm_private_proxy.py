@@ -222,6 +222,84 @@ class UsenetDiagnosticTests(unittest.TestCase):
             s.error_log_offset(self.root)
 
 
+class ReloadReadinessTests(unittest.TestCase):
+    def test_real_linux_process_title_and_start_time_identify_worker_generation(self):
+        process=subprocess.Popen(['node','-e',"process.title='nginx: worker process';console.log(process.pid);setInterval(()=>{},1000);"],
+                                 stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+        try:
+            pid=process.stdout.readline().strip()
+            self.assertTrue(pid.isdigit())
+            script=("import fs from 'node:fs';\n"+s.WORKER_READINESS+
+                    "const workers=nginxWorkers();if(![...workers].some(value=>value.startsWith(process.argv[1]+':'))) throw Error('Real worker identity missing');")
+            subprocess.run(['node','--input-type=module','-e',script,pid],capture_output=True,check=True,timeout=10)
+        finally:
+            process.kill();process.wait();process.stdout.close()
+
+    def test_old_and_new_workers_must_not_overlap_and_timeout_is_enforced(self):
+        script="import fs from 'node:fs';\n"+s.WORKER_READINESS+r'''
+const before=new Set(['10:100']);
+let reads=0,pauses=0;
+await waitForNginxWorkers(before,{read:()=>[new Set(['10:100']),new Set(['10:100','11:110']),new Set(['11:110'])][reads++],pause:async()=>{pauses++;}});
+if(reads!==3 || pauses!==2) throw Error('Old generation accepted too early');
+let now=0,blocked=false;
+try {await waitForNginxWorkers(before,{read:()=>before,now:()=>now++,timeoutMs:4,pause:async()=>{}});}
+catch(error){blocked=error.message.includes('readiness bound');}
+if(!blocked) throw Error('Stuck old worker was accepted');
+blocked=false;
+try {await waitForNginxWorkers(new Set());} catch(error){blocked=true;}
+if(!blocked) throw Error('Missing baseline accepted');
+'''
+        subprocess.run(['node','--input-type=module'],input=script.encode(),capture_output=True,check=True,timeout=10)
+        subprocess.run(['node','--input-type=module','--check'],input=s.render_code(True).encode(),capture_output=True,check=True,timeout=10)
+        self.assertIn('expectedRouteCount = 28',s.render_code(True))
+        self.assertIn('chaptarr.sawdoctor.uk',s.render_code(True))
+        self.assertNotIn('expectedRouteCount = 28',s.render_code(False))
+
+    def test_current_route_list_rejects_retired_chaptarr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'database.sqlite'
+            with contextlib.closing(sqlite3.connect(path)) as db,db:
+                db.execute('CREATE TABLE proxy_host(id,domain_names,forward_host,forward_port,access_list_id,is_deleted,enabled)')
+                db.executemany('INSERT INTO proxy_host VALUES(?,?,?,?,?,0,1)',
+                    [(i,json.dumps([f'app-{i}.sawdoctor.uk']),'192.168.0.220',8000+i,0) for i in range(1,29)])
+            self.assertEqual(len(s.routes_in(path,current=True)),28)
+            with contextlib.closing(sqlite3.connect(path)) as db,db:
+                db.execute('UPDATE proxy_host SET domain_names=? WHERE id=1',('["chaptarr.sawdoctor.uk"]',))
+            with self.assertRaisesRegex(RuntimeError,'unexpected private-test route'):
+                s.routes_in(path,current=True)
+
+
+class CurrentCandidateValidationTests(unittest.TestCase):
+    def setUp(self):
+        path=Path(__file__).with_name('test_npm_current_prepare.py')
+        spec=importlib.util.spec_from_file_location('current_candidate_fixture',path)
+        self.fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.fixture)
+        self.case=self.fixture.CandidateTests();self.case.setUp();self.addCleanup(self.case.doCleanups)
+        self.restore,self.app,self.live,self.host,self.old=self.case.prepare_environment()
+        self.fixture.s.prepare(self.fixture.source,self.fixture.complete,self.fixture.private,self.fixture.routes,self.restore)
+        self.root=self.app/'compose/npm-restore/cutover-current'
+        self.record=json.loads((self.root/'prepared.json').read_text())
+
+    def verify(self,record=None):
+        return s.validate_current_candidate(self.root,record or self.record,self.case.current,self.fixture.s,self.fixture.source,
+                                            self.fixture.complete,self.fixture.routes,self.restore)
+
+    def test_real_current_candidate_source_policy_certificates_and_runtime_identity_pass(self):
+        before=self.live.read_bytes()
+        identity=self.verify()
+        self.assertEqual(set(identity),self.fixture.s.CONTENTS-{'payload'})
+        self.assertEqual(len(s.routes_in(self.root/'payload/data/database.sqlite',current=True)),28)
+        self.assertEqual(self.live.read_bytes(),before)
+        self.assertEqual((self.old/'earlier').read_text(),'PRESERVE_EARLIER_CANDIDATE')
+
+    def test_changed_original_metadata_or_runtime_stack_are_rejected(self):
+        with self.assertRaisesRegex(RuntimeError,'live NAS stack changed'):
+            self.verify({**self.record,'existingStackSha256':'0'*64})
+        (self.root/'source-inventory.json').write_text('{}')
+        with self.assertRaisesRegex(RuntimeError,'preserved current source'):
+            self.verify()
+
+
 class StrictHttpsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
