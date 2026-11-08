@@ -35,6 +35,14 @@ class ActivationTests(unittest.TestCase):
         f.s.prepare(f.source, f.complete, f.private, f.routes, self.restore)
         self.candidate = self.app / 'compose/npm-restore/cutover-current'
         self.record = json.loads((self.candidate / 'prepared.json').read_text())
+        canonical = self.app / 'appdata/dockmon/stacks/npm-nas/compose.yaml'
+        canonical.parent.mkdir(parents=True)
+        self.stackfile.rename(canonical); self.stackfile = canonical
+        self.record['existingStackPath'] = str(canonical)
+        (self.candidate / 'prepared.json').write_text(json.dumps(self.record))
+        f.complete.live_stack.return_value = (
+            {'text': canonical.read_text(), 'env': '', 'path': '/app/data/stacks/npm-nas/compose.yaml'},
+            canonical, yaml.safe_load(canonical.read_text()))
         self.live = self.app / 'appdata/npm'
         (self.live / 'letsencrypt').mkdir()
         (self.live / 'letsencrypt/original').write_text('ORIGINAL_NAS_CERTIFICATE_STATE')
@@ -148,6 +156,8 @@ class ActivationTests(unittest.TestCase):
         self.activate()
         record = s.state()
         self.assertEqual(record['status'], 'nas-lan-active-renewal-held')
+        self.assertEqual(record['stack'], str(self.stackfile))
+        self.assertEqual(self.stackfile.name, 'compose.yaml')
         self.assertTrue(record['certificateOperationsHeld']); self.assertFalse(record['publicHandover'])
         self.assertEqual((self.work / 'recovery/data/database.sqlite').read_bytes(), self.original_db)
         self.assertEqual((self.work / 'recovery/data/database.sqlite').stat().st_ino, self.original_inode)
@@ -250,6 +260,37 @@ class ActivationTests(unittest.TestCase):
             real.jail_reload()
         self.assertEqual(calls, [('fail2ban-client', 'reload', '--restart', s.JAIL),
                                  ('fail2ban-client', 'get', s.JAIL, 'logpath')])
+
+    def test_stack_selection_accepts_standard_names_only_in_fixed_non_symbolic_directory(self):
+        parent = self.stackfile.parent
+        for name in ('compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml'):
+            self.assertEqual(s.verified_stack_path(str(parent / name)), parent / name)
+        for path in (parent.parent / 'compose.yaml', parent / 'other.yaml', parent / '../other/compose.yaml'):
+            with self.assertRaises(RuntimeError): s.verified_stack_path(str(path))
+        alias = parent / 'docker-compose.yaml'; alias.symlink_to(self.stackfile)
+        with self.assertRaisesRegex(RuntimeError, 'symbolic'):
+            s.verified_stack_path(str(alias))
+
+    def test_installer_upgrades_only_reviewed_worker_before_any_activation_state(self):
+        worker = self.work / 'worker.py'; old = b'reviewed old installer\n'; new = b'fixed installer\n'
+        worker.write_bytes(old); worker.chmod(0o700)
+        with patch.object(s, 'PREVIOUS_WORKER_SHA', s.sha(old)):
+            self.assertEqual(s.install_worker(new), worker)
+        self.assertEqual(worker.read_bytes(), new)
+        self.assertEqual((self.work / 'worker.before-stack-path-fix.py').read_bytes(), old)
+        self.assertEqual(worker.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(s.install_worker(new), worker)
+
+    def test_installer_refuses_unknown_worker_or_existing_activation_data(self):
+        worker = self.work / 'worker.py'; old = b'reviewed old installer\n'
+        worker.write_bytes(old)
+        with self.assertRaisesRegex(RuntimeError, 'retained for review'):
+            s.install_worker(b'changed')
+        (self.work / 'state.json').write_text('{}')
+        with patch.object(s, 'PREVIOUS_WORKER_SHA', s.sha(old)):
+            with self.assertRaisesRegex(RuntimeError, 'retained for review'):
+                s.install_worker(b'changed')
+        self.assertEqual(worker.read_bytes(), old)
 
 
 if __name__ == '__main__':
