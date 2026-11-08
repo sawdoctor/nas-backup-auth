@@ -84,6 +84,16 @@ def hold_certificate_worker(data):
     return source.encode()
 
 
+def environment(values):
+    result = {}
+    for value in values or []:
+        key, separator, data = value.partition('=')
+        if not separator or key in result:
+            raise RuntimeError('The current proxy environment has an unexpected form.')
+        result[key] = data
+    return result
+
+
 def trial_model(model, current, folder, guard):
     result = copy.deepcopy(model)
     if set(result.get('services', {})) != {'npm'} or set(result.get('networks', {})) != {'default'}:
@@ -91,6 +101,25 @@ def trial_model(model, current, folder, guard):
     service = result['services']['npm']
     if service.get('container_name') != 'npm-nas':
         raise RuntimeError('The candidate proxy name differs.')
+    # Compose config JSON escapes dollars for replay. Use actual runtime values
+    # for configured env/labels/commands, then escape once when writing YAML.
+    config = current['Config']
+    active_env = environment(config.get('Env'))
+    for key, value in service.get('environment', {}).items():
+        if key not in active_env:
+            if value is not None:
+                raise RuntimeError('A configured environment variable is absent from the current proxy.')
+        else:
+            service['environment'][key] = active_env[key]
+    for key in service.get('labels', {}):
+        if key not in config.get('Labels', {}):
+            raise RuntimeError('A configured label is absent from the current proxy.')
+        service['labels'][key] = config['Labels'][key]
+    for field, runtime in (('command', 'Cmd'), ('entrypoint', 'Entrypoint')):
+        if service.get(field) is not None:
+            if config.get(runtime) is None:
+                raise RuntimeError('A configured command differs from the current proxy.')
+            service[field] = config[runtime]
     service.update(container_name=NAME, image=current['Image'], restart='no', pull_policy='never')
     service['ports'] = [{'target': int(key.split('/')[0]), 'published': value, 'host_ip': '127.0.0.1', 'protocol': 'tcp', 'mode': 'ingress'}
                         for key, value in PORTS.items()]
@@ -111,6 +140,48 @@ def trial_model(model, current, folder, guard):
     result['networks'] = {'default': {'external': True, 'name': 'npm-nas_default'}}
     result['name'] = 'nas-npm-private-test'
     return result
+
+
+def compose_comparable(model):
+    """Remove only observed optional zero/default fields, never settings."""
+    result = copy.deepcopy({key: model.get(key) for key in ('services', 'networks')})
+    for service in result['services'].values():
+        service.setdefault('command', None)
+        service.setdefault('entrypoint', None)
+        for mount in service.get('volumes', []):
+            if mount.get('type') == 'bind' and isinstance(mount.get('bind'), dict):
+                if mount['bind'].get('create_host_path') is False:
+                    del mount['bind']['create_host_path']
+                if not mount['bind']:
+                    del mount['bind']
+    for network in result['networks'].values():
+        if network.get('ipam') == {}:
+            del network['ipam']
+    return result
+
+
+def difference_paths(a, b, path=''):
+    if type(a) is not type(b):
+        return [path]
+    if isinstance(a, dict):
+        found = []
+        for key in sorted(set(a) | set(b)):
+            child = path + '/' + key
+            found += [child] if key not in a or key not in b else difference_paths(a[key], b[key], child)
+        return found
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return [path + '/length']
+        return [p for i, (x, y) in enumerate(zip(a, b)) for p in difference_paths(x, y, path + '/' + str(i))]
+    return [] if a == b else [path]
+
+
+def validate_compose(wanted, rendered, escape):
+    # The native JSON output is itself replayable Compose data, including $$.
+    before, after = compose_comparable(escape(wanted)), compose_comparable(rendered)
+    changes = difference_paths(before, after)
+    if changes:
+        raise RuntimeError('The private-test Compose round trip differs at ' + ', '.join(p[:180] for p in changes[:10]) + '; values withheld.')
 
 
 def routes_in(database):
@@ -259,8 +330,7 @@ def run_trial(complete, routes, restore):
             definition.chmod(0o600)
             rendered = json.loads(command('docker', 'compose', '-p', 'nas-npm-private-test', '-f', str(definition), 'config', '--format', 'json'))
             wanted = trial_model(model, current, folder, guard)
-            if rendered.get('services') != wanted.get('services') or rendered.get('networks') != wanted.get('networks'):
-                raise RuntimeError('The private-test Compose round trip differs.')
+            validate_compose(wanted, rendered, complete.escaped)
             say('Starting the temporary proxy on 127.0.0.1 only; certificate creation/renewal held...')
             command('docker', 'compose', '-p', 'nas-npm-private-test', '-f', str(definition), 'run', '--rm', '--no-deps',
                     '--service-ports', '--pull', 'never', '--name', NAME, '--label', LABEL + '=' + token, '-d', 'npm', timeout=120)
@@ -274,6 +344,8 @@ def run_trial(complete, routes, restore):
             if actual_binds != {'/data': (str(folder / 'data'), True), '/etc/letsencrypt': (str(folder / 'letsencrypt'), True),
                                 '/app/internal/certificate.js': (str(guard), False)}:
                 raise RuntimeError('The temporary data/renewal-guard mounts differ; trial was stopped.')
+            if environment(trial['Config'].get('Env')) != environment(current['Config'].get('Env')):
+                raise RuntimeError('The temporary proxy environment differs; trial was stopped and private values withheld.')
             deadline = time.monotonic() + 100
             while time.monotonic() < deadline:
                 ping = subprocess.run(['curl', '--disable', '--silent', '--noproxy', '*', '--max-time', '2', '--output', '/dev/null',
