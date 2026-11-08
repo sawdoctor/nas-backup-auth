@@ -11,6 +11,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -221,6 +222,73 @@ def request_route(row, folder):
             'needsAttention': result.returncode != 0 or code == 0 or code >= 500 or code == 404}
 
 
+def error_log_offset(folder):
+    path = folder / 'data/logs/proxy-host-2_error.log'
+    if not path.exists():
+        return 0
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError('The temporary Usenet error log is not a regular file.')
+    return info.st_size
+
+
+def fresh_usenet_errors(folder, offset):
+    path = folder / 'data/logs/proxy-host-2_error.log'
+    if not path.exists():
+        return [], offset
+    with path.open('rb') as stream:
+        info = os.fstat(stream.fileno())
+        if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+            raise RuntimeError('The temporary Usenet error log changed type.')
+        stream.seek(max(offset if info.st_size >= offset else 0, info.st_size - 16384))
+        data = stream.read(16384)
+        end = stream.tell()
+    if data and ERROR_LOG is not None:
+        previous = ERROR_LOG.read_bytes() if ERROR_LOG.exists() else b''
+        ERROR_LOG.write_bytes((previous + b'\nNEW USENET NGINX ERRORS:\n' + data)[-1024**2:])
+        ERROR_LOG.chmod(0o600)
+    categories = (
+        ('could not be resolved', 'dns-resolution'),
+        ('host not found', 'dns-resolution'),
+        ('no resolver defined', 'resolver-not-configured'),
+        ('connect() failed', 'upstream-connect-failed'),
+        ('upstream timed out', 'upstream-timeout'),
+        ('upstream prematurely closed connection', 'upstream-closed-connection'),
+        ('no live upstreams', 'no-live-upstreams'),
+        ('upstream sent invalid header', 'invalid-upstream-header'),
+        ('SSL_do_handshake', 'upstream-tls-handshake'),
+    )
+    summaries = []
+    for line in data.decode(errors='replace').splitlines()[-40:]:
+        summary = {'categories': sorted({value for needle, value in categories if needle in line}),
+                   'referencesOriginalDockerName': bool(re.search(r'\busenet-ultimate\b(?!-nas)', line)),
+                   'referencesNasIp': '192.168.0.220' in line}
+        if not summary['categories']:
+            summary['categories'] = ['other-nginx-error']
+        if summary not in summaries:
+            summaries.append(summary)
+    return summaries, end
+
+
+def diagnose_usenet(row, folder, offset):
+    if (row['id'], row['domain'].lower(), row['upstream'], row['port'], row['accessList']) != (
+            2, 'usenet.sawdoctor.uk', '192.168.0.220', 1337, 0):
+        raise RuntimeError('The focused Usenet route identity differs.')
+    attempts = []
+    started = time.monotonic()
+    for attempt in (1, 2):
+        if attempt == 2:
+            time.sleep(2)  # Diagnostic comparison after reload, not a production delay.
+        result = request_route(row, folder)
+        errors, offset = fresh_usenet_errors(folder, offset)
+        attempts.append({**result, 'attempt': attempt, 'elapsedMs': round((time.monotonic() - started) * 1000),
+                         'newNginxErrors': errors})
+        say('USENET ATTEMPT ' + str(attempt) + ': HTTPS=' + ('trusted' if result['responseReceivedWithTrustedTls'] else 'FAILED')
+            + '; HTTP=' + str(result['httpStatus']) + '; curlExit=' + str(result['curlExit'])
+            + '; newNginxErrors=' + json.dumps(errors, separators=(',', ':')))
+    return {**attempts[-1], 'attempts': attempts}
+
+
 RENDER = r'''
 import fs from 'node:fs';
 import proxy from './internal/proxy-host.js';
@@ -269,14 +337,14 @@ def cleanup_trial(token, folder, work):
     (work / 'trial.yaml').unlink(missing_ok=True)
 
 
-def run_trial(complete, routes, restore):
+def run_trial(complete, routes, restore, usenet_only=False):
     global ERROR_LOG
     if os.geteuid() != 0 or 'inet 192.168.0.220/' not in routes.run('ip', '-4', 'addr', 'show'):
         raise RuntimeError('Run with sudo on the NAS.')
     routes.mounted(routes.APP, routes.APP_UUID)
     routes.mounted(routes.BACKUP, routes.BACKUP_UUID)
     candidate = routes.APP / 'compose/npm-restore/cutover'
-    work = routes.APP / 'compose/npm-restore/proxy-test'
+    work = routes.APP / ('compose/npm-restore/proxy-test-usenet' if usenet_only else 'compose/npm-restore/proxy-test')
     routes.no_links(work)
     work.mkdir(mode=0o700, parents=True, exist_ok=True)
     if any(work.glob('.payload-*')):
@@ -301,6 +369,10 @@ def run_trial(complete, routes, restore):
                 or complete.inventory(candidate / 'payload') != expected):
             raise RuntimeError('The immutable offline candidate changed; it was retained.')
         rows = routes_in(candidate / 'payload/data/database.sqlite')
+        if usenet_only:
+            rows = [row for row in rows if row['id'] == 2 and row['domain'].lower() == 'usenet.sawdoctor.uk']
+            if len(rows) != 1:
+                raise RuntimeError('The reviewed Usenet route is unavailable.')
         if shutil.disk_usage(routes.APP).free < 1024**3 or inspect(NAME) is not None:
             raise RuntimeError('Private-test space/name preflight failed; existing state was retained.')
         for port in PORTS.values():
@@ -362,12 +434,13 @@ def run_trial(complete, routes, restore):
             log = logged.stdout + logged.stderr
             if b'NAS PRIVATE TRIAL: CERTIFICATE RENEWAL HELD' not in log:
                 raise RuntimeError('The running backend renewal hold was not confirmed.')
+            offset = error_log_offset(folder) if usenet_only else 0
             say('Regenerating the 29 trial proxy files from the reviewed database, including its access-list relations...')
             output = command('docker', 'exec', '-i', '--workdir', '/app', NAME, 'node', '--input-type=module', stdin=RENDER.encode(), timeout=90)
             if b'NPM_PRIVATE_ROUTES_RENDERED=29' not in output:
                 raise RuntimeError('The regenerated trial route count was not confirmed.')
             for row in rows:
-                result = request_route(row, folder)
+                result = diagnose_usenet(row, folder, offset) if usenet_only else request_route(row, folder)
                 reports.append(result)
                 say(row['domain'] + ': HTTPS=' + ('trusted' if result['responseReceivedWithTrustedTls'] else 'FAILED')
                     + '; HTTP=' + str(result['httpStatus']) + '; ACL=' + str(row['accessList'])
@@ -388,6 +461,7 @@ def run_trial(complete, routes, restore):
                   'certificateCreateAndRenewHeld': True, 'temporaryContainerRemoved': removed,
                   'temporaryPayloadRemoved': not folder.exists(), 'existingNasProxyUnchanged': True,
                   'candidateUnchanged': True, 'routes': reports,
+                  'focusedUsenetDiagnostic': usenet_only,
                   'limits': 'No browser login, WebSocket/media playback, valid-password or external-client Fail2ban test. ACL bypasses need policy review.'}
         (work / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         (work / 'result.json').chmod(0o600)
@@ -409,12 +483,12 @@ def load_helpers():
 
 
 def main():
-    if sys.argv[1:] == ['--worker']:
+    if sys.argv[1:] in (['--worker'], ['--worker-usenet']):
         def interrupted(signum, frame):
             raise RuntimeError('The bounded private trial was interrupted; cleanup was requested.')
         signal.signal(signal.SIGTERM, interrupted)
         try:
-            run_trial(*load_helpers())
+            run_trial(*load_helpers(), usenet_only=sys.argv[1:] == ['--worker-usenet'])
         finally:
             path = Path(sys.argv[0])
             if path.parent == Path('/run') and path.name.startswith('nas-npm-private-'):
@@ -422,9 +496,12 @@ def main():
         return
     if sys.argv[1:] or os.geteuid() != 0 or b'inet 192.168.0.220/' not in command('ip', '-4', 'addr', 'show'):
         raise RuntimeError('Run with sudo and no arguments on the NAS.')
-    if subprocess.run(['systemctl', 'is-active', '--quiet', 'nas-npm-proxy-test.service'], capture_output=True).returncode == 0:
-        say('Private proxy test is already running; check its journal.')
-        return
+    usenet_only = globals().get('USENET_ONLY') is True
+    unit = 'nas-npm-usenet-test' if usenet_only else 'nas-npm-proxy-test'
+    for active in ('nas-npm-proxy-test', 'nas-npm-usenet-test'):
+        if subprocess.run(['systemctl', 'is-active', '--quiet', active + '.service'], capture_output=True).returncode == 0:
+            say('A private proxy test is already running; check its journal.')
+            return
     source = globals().get('INSTALL_SOURCE')
     if not isinstance(source, str) or not source.startswith('#!/usr/bin/env python3\n'):
         raise RuntimeError('The complete pinned test installer source is required.')
@@ -433,15 +510,16 @@ def main():
         os.fchmod(stream.fileno(), 0o700)
         stream.write(source)
     try:
-        subprocess.run(['systemctl', 'reset-failed', 'nas-npm-proxy-test.service'], capture_output=True)
-        command('systemd-run', '--unit=nas-npm-proxy-test', '--collect', '--description=Test NAS NPM privately with certificate operations held',
+        subprocess.run(['systemctl', 'reset-failed', unit + '.service'], capture_output=True)
+        command('systemd-run', '--unit=' + unit, '--collect', '--description=Test NAS NPM privately with certificate operations held',
                 '--property=Type=exec', '--property=UMask=0077', '--property=RuntimeMaxSec=8min',
-                '--property=TimeoutStopSec=45s', '--property=KillMode=mixed', '/usr/bin/python3', path, '--worker')
+                '--property=TimeoutStopSec=45s', '--property=KillMode=mixed', '/usr/bin/python3', path,
+                '--worker-usenet' if usenet_only else '--worker')
     except BaseException:
         Path(path).unlink(missing_ok=True)
         raise
-    say('Private NAS proxy test started in systemd. Closing SSH is safe.')
-    say('Progress: sudo journalctl -u nas-npm-proxy-test.service -n 40 --no-pager -o cat')
+    say(('Focused Usenet proxy test' if usenet_only else 'Private NAS proxy test') + ' started in systemd. Closing SSH is safe.')
+    say('Progress: sudo journalctl -u ' + unit + '.service -n 30 --no-pager -o cat')
 
 
 if __name__ == '__main__':
