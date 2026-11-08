@@ -23,6 +23,8 @@ import yaml
 
 HELPER_PIN = 'd913c6318bde2dbdd94fbe64c1d6b3cf9640f1fa'
 HELPER_SHA = '009889cbb655f24e44dc4097e3c8ced6a5344ca1c1bf99ec5712bd220aa12749'
+CURRENT_PIN = '13907d84037563a84d221f0c9032628efc35cc6d'
+CURRENT_SHA = '256dd678f45c1da6143625b16319884a1ecf8775c6068edefb64a2ebf326ae8f'
 CERT_SHA = '1f1e511e98c872b46d36309b5a2b26934e27c0ce0143107fc760f892a4c40c0c'
 NAME = 'npm-private-proxy-trial'
 LABEL = 'net.sawdoctor.npm-private-trial'
@@ -185,7 +187,7 @@ def validate_compose(wanted, rendered, escape):
         raise RuntimeError('The private-test Compose round trip differs at ' + ', '.join(p[:180] for p in changes[:10]) + '; values withheld.')
 
 
-def routes_in(database):
+def routes_in(database, current=False):
     with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
         db.execute('PRAGMA query_only=ON')
         rows = db.execute('SELECT id,domain_names,forward_host,forward_port,access_list_id '
@@ -194,11 +196,13 @@ def routes_in(database):
     for identity, names, host, port, acl in rows:
         names = json.loads(names)
         if (len(names) != 1 or not re.fullmatch(r'[A-Za-z0-9-]+\.sawdoctor\.uk', names[0])
-                or names[0].lower() == 'soundspan.sawdoctor.uk' or host not in ('192.168.0.29', '192.168.0.220')):
+                or names[0].lower() in (('soundspan.sawdoctor.uk', 'chaptarr.sawdoctor.uk') if current else ('soundspan.sawdoctor.uk',))
+                or host not in ('192.168.0.29', '192.168.0.220')):
             raise RuntimeError('An unexpected private-test route needs review.')
         result.append({'id': identity, 'domain': names[0], 'upstream': host, 'port': port, 'accessList': acl})
-    if len(result) != 29 or len({r['domain'].lower() for r in result}) != 29:
-        raise RuntimeError('The candidate no longer contains the 29 reviewed routes.')
+    count = 28 if current else 29
+    if len(result) != count or len({r['domain'].lower() for r in result}) != count:
+        raise RuntimeError('The candidate no longer contains the ' + str(count) + ' reviewed routes.')
     return result
 
 
@@ -289,15 +293,51 @@ def diagnose_usenet(row, folder, offset):
     return {**attempts[-1], 'attempts': attempts}
 
 
+WORKER_READINESS = r'''
+function nginxWorkers(procRoot = '/proc') {
+  const result = new Set();
+  for (const pid of fs.readdirSync(procRoot).filter(name => /^\d+$/.test(name))) {
+    try {
+      const command = fs.readFileSync(procRoot + '/' + pid + '/cmdline', 'utf8').replace(/\0/g, ' ').trim();
+      if (!command.startsWith('nginx: worker process')) continue;
+      const status = fs.readFileSync(procRoot + '/' + pid + '/stat', 'utf8');
+      const fields = status.slice(status.lastIndexOf(')') + 2).trim().split(/\s+/);
+      if (!/^\d+$/.test(fields[19] || '')) throw Error('Nginx worker start identity unavailable');
+      result.add(pid + ':' + fields[19]);
+    } catch (error) {
+      if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error;
+    }
+  }
+  return result;
+}
+async function waitForNginxWorkers(before, options = {}) {
+  if (!before.size) throw Error('No baseline Nginx workers were identified');
+  const read = options.read || (() => nginxWorkers());
+  const now = options.now || Date.now;
+  const pause = options.pause || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const deadline = now() + (options.timeoutMs || 15000);
+  while (now() < deadline) {
+    const after = read();
+    if (after.size && [...before].every(token => !after.has(token))) return;
+    await pause(50);
+  }
+  throw Error('New Nginx workers did not replace the old generation within the readiness bound');
+}
+'''
+
+
 RENDER = r'''
 import fs from 'node:fs';
 import proxy from './internal/proxy-host.js';
 import nginx from './internal/nginx.js';
 import db from './db.js';
+''' + WORKER_READINESS + r'''
+const expectedRouteCount = 29;
+const retiredDomains = new Set(["soundspan.sawdoctor.uk"]);
 try {
   const access = {can: async () => ({permission_visibility: 'all'})};
   const rows = (await proxy.getAll(access, ['owner', 'certificate', 'access_list.[clients,items]'])).filter(h => h.enabled);
-  if (rows.length !== 29 || rows.some(h => h.domain_names.some(n => n.toLowerCase() === 'soundspan.sawdoctor.uk'))) throw Error('Route count/retirement differs');
+  if (rows.length !== expectedRouteCount || rows.some(h => h.domain_names.some(n => retiredDomains.has(n.toLowerCase())))) throw Error('Route count/retirement differs');
   await nginx.bulkGenerateConfigs('proxy_host', rows);
   for (const row of rows) {
     const text = fs.readFileSync('/data/nginx/proxy_host/' + row.id + '.conf', 'utf8');
@@ -306,7 +346,10 @@ try {
     if (!host || host[1] !== row.forward_host || !port || Number(port[1]) !== row.forward_port) throw Error('Rendered upstream differs');
   }
   await nginx.test();
+  const workersBeforeReload = nginxWorkers();
   await nginx.reload();
+  await waitForNginxWorkers(workersBeforeReload);
+  console.log('NPM_PRIVATE_NEW_WORKERS_READY');
   console.log('NPM_PRIVATE_ROUTES_RENDERED=' + rows.length);
 } catch (error) {
   console.error(error);
@@ -315,6 +358,47 @@ try {
   await db().destroy();
 }
 '''
+
+
+def render_code(current=False):
+    return (RENDER.replace('const expectedRouteCount = 29;', 'const expectedRouteCount = 28;', 1)
+            .replace('const retiredDomains = new Set(["soundspan.sawdoctor.uk"]);',
+                     'const retiredDomains = new Set(["soundspan.sawdoctor.uk","chaptarr.sawdoctor.uk"]);', 1)) if current else RENDER
+
+
+def validate_current_candidate(candidate, record, current, stage, source, complete, routes, restore):
+    if ({p.name for p in candidate.iterdir()} != stage.CONTENTS or record.get('format') != stage.FORMAT
+            or record.get('status') != 'current-offline-not-activated' or record.get('nasImage') != current['Image']
+            or record.get('retiredDomains') != stage.RETIRED or record.get('counts', {}).get('proxy_host') != 28
+            or record.get('shelfmarkAudio', {}).get('certificateId') != 86):
+        raise RuntimeError('The accepted current 28-route candidate identity differs.')
+    metadata = {name: sha(routes.read(candidate / name, 64 * 1024**2 if name == 'source-database.sqlite' else 16 * 1024**2))
+                for name in sorted(stage.CONTENTS - {'payload'})}
+    ready = record.get('sourceExport', {})
+    if (ready.get('format') != stage.EXPORT_FORMAT or ready.get('createdUtc') != record.get('sourceSnapshot')
+            or metadata['source-manifest.json'] != ready.get('manifestSha256')
+            or metadata['source-inventory.json'] != ready.get('inventorySha256')
+            or metadata['source-database.sqlite'] != record.get('sourceDatabaseSha256')):
+        raise RuntimeError('The preserved current source NPM metadata differs.')
+    manifest = json.loads(routes.read(candidate / 'source-manifest.json'))
+    if (manifest.get('sourceHost') != '192.168.0.29' or manifest.get('container', {}).get('Image') != source.SOURCE_IMAGE
+            or manifest.get('counts') != record['counts'] or manifest.get('shelfmarkAudio') != record['shelfmarkAudio']):
+        raise RuntimeError('The current NPM source report changed.')
+    with contextlib.closing(sqlite3.connect((candidate / 'source-database.sqlite').as_uri() + '?mode=ro', uri=True)) as original, \
+            contextlib.closing(sqlite3.connect((candidate / 'payload/data/database.sqlite').as_uri() + '?mode=ro', uri=True)) as adjusted:
+        changes = routes.edits(routes.routes(original))
+        if changes != record.get('changes'):
+            raise RuntimeError('The reviewed current 21-address edit plan changed.')
+        routes.compare_all(original, adjusted, changes)
+    counts, shelfmark, checked = source.validate_policy(candidate / 'payload/data/database.sqlite', candidate / 'payload')
+    if (counts != record['counts'] or shelfmark != record['shelfmarkAudio']
+            or checked != record.get('checkedCertificateKeyPairs')):
+        raise RuntimeError('The current NPM policy/certificate report changed.')
+    stored, host, model = complete.live_stack(routes, restore, current)
+    if (str(host) != record.get('existingStackPath') or sha(stored['text'].encode()) != record.get('existingStackSha256')
+            or sha(json.dumps(stored['env'], sort_keys=True).encode()) != record.get('existingStackEnvSha256')):
+        raise RuntimeError('The live NAS stack changed since current-candidate preparation.')
+    return metadata
 
 
 def cleanup_trial(token, folder, work):
@@ -337,14 +421,16 @@ def cleanup_trial(token, folder, work):
     (work / 'trial.yaml').unlink(missing_ok=True)
 
 
-def run_trial(complete, routes, restore, usenet_only=False):
+def run_trial(complete, routes, restore, usenet_only=False, current_tools=None):
     global ERROR_LOG
     if os.geteuid() != 0 or 'inet 192.168.0.220/' not in routes.run('ip', '-4', 'addr', 'show'):
         raise RuntimeError('Run with sudo on the NAS.')
     routes.mounted(routes.APP, routes.APP_UUID)
     routes.mounted(routes.BACKUP, routes.BACKUP_UUID)
-    candidate = routes.APP / 'compose/npm-restore/cutover'
-    work = routes.APP / ('compose/npm-restore/proxy-test-usenet' if usenet_only else 'compose/npm-restore/proxy-test')
+    fresh = current_tools is not None
+    candidate = routes.APP / ('compose/npm-restore/cutover-current' if fresh else 'compose/npm-restore/cutover')
+    work = routes.APP / ('compose/npm-restore/proxy-test-current' if fresh else
+                        'compose/npm-restore/proxy-test-usenet' if usenet_only else 'compose/npm-restore/proxy-test')
     routes.no_links(work)
     work.mkdir(mode=0o700, parents=True, exist_ok=True)
     if any(work.glob('.payload-*')):
@@ -359,7 +445,10 @@ def run_trial(complete, routes, restore, usenet_only=False):
     with routes.locked(routes.LOCK):
         current = routes.target_bindings()
         record = json.loads(routes.read(candidate / 'prepared.json'))
-        if (record.get('format') != complete.FORMAT or record.get('status') != 'complete-offline-not-activated'
+        metadata_before = None
+        if fresh:
+            stage, source_validator = current_tools
+        elif (record.get('format') != complete.FORMAT or record.get('status') != 'complete-offline-not-activated'
                 or record.get('nasImage') != current['Image'] or record.get('retiredService') != complete.RETIRED):
             raise RuntimeError('The accepted complete offline candidate identity differs.')
         inventory_path = candidate / 'payload-inventory.json'
@@ -368,7 +457,9 @@ def run_trial(complete, routes, restore, usenet_only=False):
                 or complete.file_digest(candidate / 'ready.yaml') != record['readySha256']
                 or complete.inventory(candidate / 'payload') != expected):
             raise RuntimeError('The immutable offline candidate changed; it was retained.')
-        rows = routes_in(candidate / 'payload/data/database.sqlite')
+        if fresh:
+            metadata_before = validate_current_candidate(candidate, record, current, stage, source_validator, complete, routes, restore)
+        rows = routes_in(candidate / 'payload/data/database.sqlite', current=fresh)
         if usenet_only:
             rows = [row for row in rows if row['id'] == 2 and row['domain'].lower() == 'usenet.sawdoctor.uk']
             if len(rows) != 1:
@@ -391,7 +482,13 @@ def run_trial(complete, routes, restore, usenet_only=False):
             say('Copying only the bounded NPM trial payload; no image pull or build...')
             command('rsync', '-aHAX', '--numeric-ids', '--one-file-system', '--no-devices', '--no-specials',
                     '--', str(candidate / 'payload') + '/', str(folder) + '/', timeout=180)
-            if complete.inventory(folder) != expected:
+            copied = complete.inventory(folder)
+            if fresh and copied != expected:
+                restored = stage.restore_copied_modes(folder, expected, copied)
+                if restored:
+                    say('Restored ' + str(restored) + ' exact source modes in the disposable trial copy; rechecking...')
+                    copied = complete.inventory(folder)
+            if copied != expected:
                 raise RuntimeError('The temporary trial copy differs from the accepted candidate.')
             guard = folder / 'certificate-held.js'
             guard.write_bytes(held)
@@ -435,10 +532,13 @@ def run_trial(complete, routes, restore, usenet_only=False):
             if b'NAS PRIVATE TRIAL: CERTIFICATE RENEWAL HELD' not in log:
                 raise RuntimeError('The running backend renewal hold was not confirmed.')
             offset = error_log_offset(folder) if usenet_only else 0
-            say('Regenerating the 29 trial proxy files from the reviewed database, including its access-list relations...')
-            output = command('docker', 'exec', '-i', '--workdir', '/app', NAME, 'node', '--input-type=module', stdin=RENDER.encode(), timeout=90)
-            if b'NPM_PRIVATE_ROUTES_RENDERED=29' not in output:
+            route_count = 28 if fresh else 29
+            say('Regenerating the ' + str(route_count) + ' trial proxy files and waiting for new Nginx workers...')
+            output = command('docker', 'exec', '-i', '--workdir', '/app', NAME, 'node', '--input-type=module', stdin=render_code(fresh).encode(), timeout=90)
+            if (('NPM_PRIVATE_ROUTES_RENDERED=' + str(route_count)).encode() not in output
+                    or b'NPM_PRIVATE_NEW_WORKERS_READY' not in output):
                 raise RuntimeError('The regenerated trial route count was not confirmed.')
+            say('New Nginx worker generation is ready; starting strict HTTPS route checks.')
             for row in rows:
                 result = diagnose_usenet(row, folder, offset) if usenet_only else request_route(row, folder)
                 reports.append(result)
@@ -454,6 +554,11 @@ def run_trial(complete, routes, restore, usenet_only=False):
             raise RuntimeError('The existing NAS proxy changed during the test; investigate before handover.')
         if complete.inventory(candidate / 'payload') != expected:
             raise RuntimeError('The immutable candidate changed during the test; investigate before handover.')
+        if fresh:
+            metadata_after = {name: sha(routes.read(candidate / name, 64 * 1024**2 if name == 'source-database.sqlite' else 16 * 1024**2))
+                              for name in metadata_before}
+            if metadata_after != metadata_before:
+                raise RuntimeError('The accepted current candidate metadata changed during the test.')
         attention = sum(r['needsAttention'] for r in reports)
         result = {'format': FORMAT, 'status': 'needs-attention' if attention else 'route-responses-checked',
                   'testedUtc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
@@ -462,6 +567,7 @@ def run_trial(complete, routes, restore, usenet_only=False):
                   'temporaryPayloadRemoved': not folder.exists(), 'existingNasProxyUnchanged': True,
                   'candidateUnchanged': True, 'routes': reports,
                   'focusedUsenetDiagnostic': usenet_only,
+                  'currentCandidate': fresh, 'candidatePath': str(candidate), 'newNginxWorkerGenerationReady': True,
                   'limits': 'No browser login, WebSocket/media playback, valid-password or external-client Fail2ban test. ACL bypasses need policy review.'}
         (work / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         (work / 'result.json').chmod(0o600)
@@ -482,13 +588,29 @@ def load_helpers():
     return complete, *complete.load_helpers()
 
 
+def load_current_helpers():
+    url = 'https://raw.githubusercontent.com/sawdoctor/nas-backup-auth/' + CURRENT_PIN + '/scripts/prepare-nas-current-npm.py'
+    with urllib.request.urlopen(url, timeout=30) as response:
+        data = response.read(128 * 1024 + 1)
+    if sha(data) != CURRENT_SHA:
+        raise RuntimeError('The pinned current-candidate validator failed its integrity check.')
+    stage = types.ModuleType('_accepted_current_npm_candidate')
+    exec(compile(data, url, 'exec'), stage.__dict__)
+    source, complete, old_private, routes, restore = stage.load_helpers()
+    return complete, routes, restore, (stage, source)
+
+
 def main():
-    if sys.argv[1:] in (['--worker'], ['--worker-usenet']):
+    if sys.argv[1:] in (['--worker'], ['--worker-usenet'], ['--worker-current']):
         def interrupted(signum, frame):
             raise RuntimeError('The bounded private trial was interrupted; cleanup was requested.')
         signal.signal(signal.SIGTERM, interrupted)
         try:
-            run_trial(*load_helpers(), usenet_only=sys.argv[1:] == ['--worker-usenet'])
+            if sys.argv[1:] == ['--worker-current']:
+                complete, routes, restore, current_tools = load_current_helpers()
+                run_trial(complete, routes, restore, current_tools=current_tools)
+            else:
+                run_trial(*load_helpers(), usenet_only=sys.argv[1:] == ['--worker-usenet'])
         finally:
             path = Path(sys.argv[0])
             if path.parent == Path('/run') and path.name.startswith('nas-npm-private-'):
@@ -497,8 +619,11 @@ def main():
     if sys.argv[1:] or os.geteuid() != 0 or b'inet 192.168.0.220/' not in command('ip', '-4', 'addr', 'show'):
         raise RuntimeError('Run with sudo and no arguments on the NAS.')
     usenet_only = globals().get('USENET_ONLY') is True
-    unit = 'nas-npm-usenet-test' if usenet_only else 'nas-npm-proxy-test'
-    for active in ('nas-npm-proxy-test', 'nas-npm-usenet-test'):
+    fresh = globals().get('CURRENT_CANDIDATE') is True
+    if fresh and usenet_only:
+        raise RuntimeError('Choose either the current 28-route test or the earlier focused diagnostic.')
+    unit = 'nas-npm-current-test' if fresh else 'nas-npm-usenet-test' if usenet_only else 'nas-npm-proxy-test'
+    for active in ('nas-npm-proxy-test', 'nas-npm-usenet-test', 'nas-npm-current-test'):
         if subprocess.run(['systemctl', 'is-active', '--quiet', active + '.service'], capture_output=True).returncode == 0:
             say('A private proxy test is already running; check its journal.')
             return
@@ -514,11 +639,12 @@ def main():
         command('systemd-run', '--unit=' + unit, '--collect', '--description=Test NAS NPM privately with certificate operations held',
                 '--property=Type=exec', '--property=UMask=0077', '--property=RuntimeMaxSec=8min',
                 '--property=TimeoutStopSec=45s', '--property=KillMode=mixed', '/usr/bin/python3', path,
-                '--worker-usenet' if usenet_only else '--worker')
+                '--worker-current' if fresh else '--worker-usenet' if usenet_only else '--worker')
     except BaseException:
         Path(path).unlink(missing_ok=True)
         raise
-    say(('Focused Usenet proxy test' if usenet_only else 'Private NAS proxy test') + ' started in systemd. Closing SSH is safe.')
+    say(('Current 28-route private proxy test' if fresh else 'Focused Usenet proxy test' if usenet_only else 'Private NAS proxy test')
+        + ' started in systemd. Closing SSH is safe.')
     say('Progress: sudo journalctl -u ' + unit + '.service -n 30 --no-pager -o cat')
 
 
