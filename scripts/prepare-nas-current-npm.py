@@ -218,6 +218,47 @@ def inventory_difference(expected, actual):
     return summary, details
 
 
+def restore_copied_modes(payload, expected, actual):
+    """Restore source modes only after every other recorded attribute matches."""
+    before, after = expected.get('entries', {}), actual.get('entries', {})
+    if expected.get('bytes') != actual.get('bytes') or set(before) != set(after):
+        return 0
+    changes = []
+    for relative in sorted(before):
+        wanted, present = before[relative], after[relative]
+        if wanted == present:
+            continue
+        fields = {key for key in set(wanted) | set(present) if wanted.get(key) != present.get(key)}
+        if fields != {'mode'}:
+            return 0
+        mode = wanted['mode']
+        if wanted.get('kind') not in ('file', 'directory') or type(mode) is not int or not 0 <= mode <= 0o7777:
+            raise RuntimeError('An unsupported copied entry permission needs review; the live proxy was retained.')
+        name = PurePosixPath(relative)
+        if name.is_absolute() or '..' in name.parts:
+            raise RuntimeError('A source permission path is outside its private copy.')
+        path = payload / relative
+        if (any(p.is_symlink() for p in (path, *path.parents))
+                or not path.resolve().is_relative_to(payload.resolve())):
+            raise RuntimeError('A copied permission path contains a symbolic link; current data retained.')
+        changes.append((path, wanted, present))
+    for path, wanted, present in changes:
+        info = path.lstat()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            opened = os.fstat(fd)
+            correct_kind = stat.S_ISREG(opened.st_mode) if wanted['kind'] == 'file' else stat.S_ISDIR(opened.st_mode)
+            if ((opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino) or not correct_kind
+                    or stat.S_IMODE(opened.st_mode) not in (present['mode'], wanted['mode'])
+                    or (opened.st_uid, opened.st_gid) != (present['uid'], present['gid'])):
+                raise RuntimeError('A temporary copied entry changed before permission restoration.')
+            if stat.S_IMODE(opened.st_mode) != wanted['mode']:
+                os.fchmod(fd, wanted['mode'])
+        finally:
+            os.close(fd)
+    return len(changes)
+
+
 def validate_export(extracted, ready, source, diagnostic_path=None):
     if (file_digest(extracted / 'manifest.json') != ready['manifestSha256']
             or file_digest(extracted / 'payload-inventory.json') != ready['inventorySha256']):
@@ -232,6 +273,11 @@ def validate_export(extracted, ready, source, diagnostic_path=None):
         raise RuntimeError('The current NPM export differs from the reviewed source/retirement/certificate report.')
     payload = extracted / 'payload'
     actual = source.inventory(payload)
+    if actual != expected and expected['bytes'] == ready['payloadBytes']:
+        restored = restore_copied_modes(payload, expected, actual)
+        if restored:
+            say('Restored ' + str(restored) + ' recorded source permission modes on the private copy; rechecking the complete inventory...')
+            actual = source.inventory(payload)
     if actual != expected or expected['bytes'] != ready['payloadBytes']:
         summary, details = inventory_difference(expected, actual)
         say('NPM INVENTORY DIFFERENCE SUMMARY: ' + json.dumps(summary, sort_keys=True))
