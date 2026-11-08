@@ -22,13 +22,14 @@ APP_UUID = 'e5af079d-1bbd-4ad2-a94b-5a6dbaf8b4d6'
 APP = Path('/srv/dev-disk-by-uuid-' + APP_UUID)
 WORK = APP / 'compose/npm-restore/lan-activation'
 LIVE = APP / 'appdata/npm'
-STACK = APP / 'appdata/dockmon/stacks/npm-nas/docker-compose.yml'
+STACK = None  # Selected from the candidate and Dockmon's matching verified path.
 LOCK = Path('/run/lock/sawdoctor-nas-backup.lock')
 FORMAT = 'sawdoctor-npm-lan-activation-v1'
 LABEL = 'net.sawdoctor.npm-lan-activation'
 JAIL = 'sawdoctor-npm-auth'
 PIN = 'd2dd820b2337373275a5928d3c9bb55388caa2e6'
 PIN_SHA = '7ba938e5d4f2332571284c9742ba8b9a0f74d1fd49cf7431a32b18e6163abe63'
+PREVIOUS_WORKER_SHA = '770396aef373e466abb7815868854053c203a423fa180ae21d75d12dc4dfe53c'
 PORTS = {'80/tcp': [{'HostIp': '192.168.0.220', 'HostPort': '10080'}],
          '81/tcp': [{'HostIp': '192.168.0.220', 'HostPort': '10081'}],
          '443/tcp': [{'HostIp': '192.168.0.220', 'HostPort': '10443'}]}
@@ -113,6 +114,15 @@ def host():
 
 def compose(*args):
     return command('docker', 'compose', '-p', 'npm-nas', '-f', str(STACK), *args, timeout=150)
+
+
+def verified_stack_path(value):
+    path = Path(value)
+    if (path.parent != APP / 'appdata/dockmon/stacks/npm-nas'
+            or path.name not in ('compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml')):
+        raise RuntimeError('The recorded stack is outside the existing Dockmon NPM stack directory.')
+    safe(path)
+    return path
 
 
 def state():
@@ -204,10 +214,12 @@ def validate_test(test, candidate, record):
 
 
 def rollback(record):
+    global STACK
     if (record.get('format') != FORMAT or record.get('status') not in
             ('activating', 'nas-lan-active-renewal-held', 'rollback-needs-review')):
         raise RuntimeError('No matching active NAS proxy operation is available to roll back.')
-    if record.get('stack') != str(STACK) or record.get('live') != str(LIVE):
+    STACK = verified_stack_path(record.get('stack', ''))
+    if record.get('live') != str(LIVE):
         raise RuntimeError('The saved recovery paths differ from the fixed NAS proxy paths.')
     original = WORK / 'recovery/stack.before.yaml'
     if sha(read(original)) != record['oldStackSha256']:
@@ -243,10 +255,12 @@ def rollback(record):
 
 
 def activate(private):
+    global STACK
     complete, routes, restore, (stage, source) = private.load_current_helpers()
     if (WORK / 'state.json').exists():
         previous = state()
         if previous.get('format') == FORMAT and previous.get('status') == 'nas-lan-active-renewal-held':
+            STACK = verified_stack_path(previous.get('stack', ''))
             runtime(inspect() or {}, previous)
             if (sha(read(STACK)) != previous['activeStackSha256']
                     or sha(read(WORK / 'certificate-held.js')) != previous['certificateWorkerSha256']):
@@ -265,8 +279,11 @@ def activate(private):
     metadata = private.validate_current_candidate(candidate, record, current, stage, source, complete, routes, restore)
     validate_test(json.loads(read(APP / 'compose/npm-restore/proxy-test-current/result.json')), candidate, record)
     stored, stack, model = complete.live_stack(routes, restore, current)
-    if stack != STACK or current['HostConfig'].get('PortBindings') != PORTS:
-        raise RuntimeError('The existing NAS proxy stack path or ports differ.')
+    STACK = verified_stack_path(record.get('existingStackPath', ''))
+    if stack != STACK:
+        raise RuntimeError('The current Dockmon stack path differs from the verified candidate record.')
+    if current['HostConfig'].get('PortBindings') != PORTS:
+        raise RuntimeError('The NAS proxy ports differ from the reviewed 10080/10081/10443 bindings.')
     safe(LIVE); safe(STACK)
     for name in ('data', 'letsencrypt'):
         safe(LIVE / name)
@@ -375,6 +392,21 @@ def load_private():
     return module
 
 
+def install_worker(data):
+    worker = WORK / 'worker.py'
+    if worker.exists() and read(worker) != data:
+        previous = read(worker)
+        allowed = {'worker.py', 'private-error.log'}
+        if sha(previous) != PREVIOUS_WORKER_SHA or {p.name for p in WORK.iterdir()} - allowed:
+            raise RuntimeError('A different worker or existing activation state was retained for review.')
+        # The failed preflight created no data copy/recovery/state. Preserve the
+        # exact reviewed old worker before replacing only that installer file.
+        atomic(WORK / 'worker.before-stack-path-fix.py', previous)
+    if not worker.exists() or read(worker) != data:
+        atomic(worker, data); worker.chmod(0o700)
+    return worker
+
+
 def main():
     os.umask(0o077)
     host()
@@ -406,10 +438,7 @@ def main():
         if Path(__file__).resolve() != worker:
             raise RuntimeError('The complete pinned installer source is required.')
         data = read(worker).decode()
-    if worker.exists() and read(worker) != data.encode():
-        raise RuntimeError('A different activation worker already exists; it was retained.')
-    if not worker.exists():
-        atomic(worker, data.encode()); worker.chmod(0o700)
+    worker = install_worker(data.encode())
     subprocess.run(['systemctl', 'reset-failed', unit + '.service'], capture_output=True)
     command('systemd-run', '--unit=' + unit, '--collect', '--description=Activate verified NAS NPM on existing LAN ports with renewal held',
             '--property=Type=exec', '--property=UMask=0077', '--property=RuntimeMaxSec=8min',
