@@ -156,6 +156,53 @@ class CandidateTests(unittest.TestCase):
         self.assertNotIn('data/custom',output.getvalue())
         self.assertNotIn('PRIVATE_CUSTOM_FILE',report.read_text())
 
+    def test_exact_source_modes_are_restored_only_on_four_verified_private_copy_entries(self):
+        extracted=self.extract();payload=extracted/'payload'
+        for name,mode in (('data/custom',0o600),('data/keys.json',0o600),('data/database.sqlite',0o600),('letsencrypt',0o700)):
+            (payload/name).chmod(mode)
+        before=source.inventory(payload)
+        self.assertEqual(s.inventory_difference(self.expected,before)[0]['differingFields'],{'mode':4})
+        original=self.database.read_bytes()
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(s.validate_export(extracted,self.ready,source),self.manifest)
+        self.assertIn('Restored 4 recorded source permission modes',output.getvalue())
+        self.assertEqual(source.inventory(payload),self.expected)
+        self.assertEqual(self.database.read_bytes(),original)
+        self.assertNotIn('PRIVATE_',output.getvalue())
+
+    def test_any_content_or_other_metadata_difference_blocks_all_permission_restoration(self):
+        extracted=self.extract();payload=extracted/'payload'
+        private=payload/'data/custom';private.chmod(0o600)
+        other=payload/'data/keys.json';other.write_text('TAMPERED')
+        with patch.object(s.os,'fchmod',wraps=os.fchmod) as chmod,contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError,'source inventory'):
+                s.validate_export(extracted,self.ready,source)
+        chmod.assert_not_called()
+        self.assertEqual(private.stat().st_mode & 0o7777,0o600)
+
+    def test_permission_restore_refuses_symbolic_entries_and_restores_directory_special_bits(self):
+        extracted=self.extract();payload=extracted/'payload'
+        directory=payload/'data';directory.chmod(0o2750)
+        expected=source.inventory(payload)
+        directory.chmod(0o750)
+        self.assertEqual(s.restore_copied_modes(payload,expected,source.inventory(payload)),1)
+        self.assertEqual(directory.stat().st_mode & 0o7777,0o2750)
+        expected=source.inventory(payload);actual=copy.deepcopy(expected)
+        actual['entries']['data/custom-link']['mode']=0o700
+        with self.assertRaisesRegex(RuntimeError,'unsupported copied entry'):
+            s.restore_copied_modes(payload,expected,actual)
+
+    def test_permission_restore_handles_multiple_entries_for_one_hardlinked_inode(self):
+        extracted=self.extract();payload=extracted/'payload'
+        private=payload/'data/custom';other=payload/'data/custom-hardlink'
+        os.link(private,other)
+        expected=source.inventory(payload)
+        private.chmod(0o600)
+        self.assertEqual(s.restore_copied_modes(payload,expected,source.inventory(payload)),2)
+        self.assertEqual(source.inventory(payload),expected)
+        self.assertEqual(private.stat().st_ino,other.stat().st_ino)
+
     def test_diagnostic_distinguishes_missing_files_content_and_timestamp_changes(self):
         before={'bytes':3,'entries':{'PRIVATE_PATH':{'kind':'file','size':3,'sha256':'a','mtimeNs':100,'xattrs':{}},
                                    'PRIVATE_MISSING':{'kind':'file','size':0}}}
