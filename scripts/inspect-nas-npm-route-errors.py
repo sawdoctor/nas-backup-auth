@@ -56,7 +56,7 @@ def main():
     with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
         for row in db.execute('SELECT id,domain_names,forward_scheme,forward_host,forward_port,locations,advanced_config '
                               'FROM proxy_host WHERE id IN (2,31,32) ORDER BY id'):
-            locations = json.loads(row[5] or '[]')
+            locations = json.loads(row[5] or '[]') or []
             text = (row[6] or '') + (row[5] or '')
             safe = {'id': row[0], 'domains': json.loads(row[1]), 'scheme': row[2], 'host': safe_host(row[3]), 'port': row[4],
                     'customLocationCount': len(locations),
