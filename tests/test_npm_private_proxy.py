@@ -163,6 +163,65 @@ class ComposeRoundTripTests(unittest.TestCase):
         self.assertEqual(rendered['services']['npm']['environment']['PRIVATE'],'SECRET_$$value')
 
 
+class UsenetDiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name)
+        self.log=self.root/'data/logs/proxy-host-2_error.log'
+        self.log.parent.mkdir(parents=True)
+        self.row={'id':2,'domain':'usenet.sawdoctor.uk','upstream':'192.168.0.220','port':1337,'accessList':0}
+
+    def test_only_new_errors_are_summarized_without_secrets(self):
+        self.log.write_text('OLD_ERROR_SECRET upstream timed out\n')
+        offset=s.error_log_offset(self.root)
+        with self.log.open('a') as out:
+            out.write('usenet-ultimate could not be resolved, request: /api?apikey=NEW_SECRET\n')
+            out.write('connect() failed, upstream: http://192.168.0.220:1337/?token=OTHER_SECRET\n')
+        private=self.root/'private-error.log'
+        with patch.object(s,'ERROR_LOG',private):
+            summaries,end=s.fresh_usenet_errors(self.root,offset)
+        self.assertEqual(end,self.log.stat().st_size)
+        self.assertEqual(summaries[0]['categories'],['dns-resolution'])
+        self.assertTrue(summaries[0]['referencesOriginalDockerName'])
+        self.assertTrue(summaries[1]['referencesNasIp'])
+        self.assertNotIn('SECRET',json.dumps(summaries))
+        self.assertNotIn('OLD_ERROR_SECRET',private.read_text())
+        self.assertEqual(private.stat().st_mode & 0o777,0o600)
+        with patch.object(s,'ERROR_LOG',None):
+            self.assertEqual(s.fresh_usenet_errors(self.root,end),([],end))
+
+    def test_retry_preserves_initial_failure_and_separate_new_errors(self):
+        self.log.write_text('old unrelated error\n')
+        offset=s.error_log_offset(self.root)
+        calls=[]
+        def request(row,folder):
+            calls.append(row)
+            if len(calls)==1:
+                with self.log.open('a') as out:
+                    out.write('usenet-ultimate could not be resolved, private=SECRET\n')
+            status=502 if len(calls)==1 else 200
+            return {**row,'httpStatus':status,'curlExit':0,'responseReceivedWithTrustedTls':True,'needsAttention':status>=500}
+        with patch.object(s,'request_route',side_effect=request),patch.object(s.time,'sleep') as sleep,patch.object(s,'ERROR_LOG',None),patch.object(s,'say') as say:
+            report=s.diagnose_usenet(self.row,self.root,offset)
+        sleep.assert_called_once_with(2)
+        self.assertEqual(len(calls),2)
+        self.assertEqual([r['httpStatus'] for r in report['attempts']],[502,200])
+        self.assertTrue(report['attempts'][0]['needsAttention'])
+        self.assertFalse(report['needsAttention'])
+        self.assertEqual(report['attempts'][1]['newNginxErrors'],[])
+        self.assertNotIn('SECRET',str(say.call_args_list))
+
+    def test_foreign_route_and_linked_log_are_rejected(self):
+        with patch.object(s,'request_route') as request:
+            with self.assertRaisesRegex(RuntimeError,'identity differs'):
+                s.diagnose_usenet({**self.row,'domain':'other.sawdoctor.uk'},self.root,0)
+        request.assert_not_called()
+        target=self.root/'foreign';target.write_text('PRIVATE')
+        self.log.symlink_to(target)
+        with self.assertRaisesRegex(RuntimeError,'not a regular file'):
+            s.error_log_offset(self.root)
+
+
 class StrictHttpsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
