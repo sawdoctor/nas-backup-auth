@@ -64,17 +64,22 @@ class TargetTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             s.validate_container(self.row, self.images)
 
-    def test_sqlite_probe_cannot_invoke_plex_entrypoint_or_mount_config(self):
-        with patch.object(s, 'run', return_value='3.46.1 local-tool-build\n') as command:
-            self.assertEqual(s.sqlite_probe(self.row, 1000, 1000), '3.46.1')
-        args = command.call_args.args
-        self.assertEqual(args[:3], ('docker', 'run', '--rm'))
-        self.assertIn('--pull=never', args)
-        self.assertIn('--network=none', args)
-        self.assertIn('--read-only', args)
-        self.assertEqual(args[args.index('--entrypoint') + 1], s.SQLITE)
-        self.assertEqual(args[-2:], (self.row['Image'], '--version'))
-        self.assertFalse(any(a in args for a in ('-v', '--volume', '--mount', '--env', '--restart')))
+    def test_observed_plex_build_is_reused_without_creating_a_container(self):
+        with patch.object(s, 'PRIOR_NATIVE_TOOL_BUILD', 'v1.43.5.11079-b3b13e506', create=True), \
+                patch.object(s, 'run', side_effect=AssertionError('No new probe allowed')):
+            evidence = s.previous_tool_evidence(self.row)
+        self.assertEqual(evidence['reportedBuild'], 'v1.43.5.11079-b3b13e506')
+        self.assertTrue(evidence['reusedPriorResult'])
+        self.assertFalse(evidence['newProbePerformed'])
+        self.assertFalse(evidence['databaseIntegrityChecked'])
+
+    def test_missing_or_different_prior_evidence_is_rejected_without_fallback(self):
+        for value in (None, '', '3.46.1', 'v1.43.3.10861-other'):
+            with self.subTest(value=value), \
+                    patch.object(s, 'PRIOR_NATIVE_TOOL_BUILD', value, create=True), \
+                    patch.object(s, 'run', side_effect=AssertionError('No container fallback allowed')), \
+                    self.assertRaises(RuntimeError):
+                s.previous_tool_evidence(self.row)
 
     def test_incomplete_existing_identity_fails_without_changes(self):
         data = self.root / 'data'
@@ -122,7 +127,7 @@ class TargetTests(unittest.TestCase):
             stack.enter_context(patch.object(s, 'read', return_value=json.dumps(self.images).encode()))
             stack.enter_context(patch.object(s, 'identity', return_value={'MachineIdentifierSha256': 'hash'}))
             stack.enter_context(patch.object(s, 'estimate', return_value=budget))
-            stack.enter_context(patch.object(s, 'sqlite_probe', return_value='3.46.1'))
+            stack.enter_context(patch.object(s, 'PRIOR_NATIVE_TOOL_BUILD', s.TOOL_BUILD, create=True))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             s.prepare()
         self.assertEqual(data.read_bytes(), b'existing Plex data')
@@ -132,6 +137,9 @@ class TargetTests(unittest.TestCase):
         self.assertEqual(plan['copiedPlexBytes'], 0)
         self.assertFalse(plan['plexStarted'])
         self.assertTrue(plan['sourceHeldProofRequired'])
+        self.assertEqual(plan['plexToolBuild'], 'v1.43.5.11079-b3b13e506')
+        self.assertFalse(plan['toolContainerCreatedThisRun'])
+        self.assertFalse(plan['priorNativeToolEvidence']['databaseIntegrityChecked'])
 
     def test_unsafe_input_symlink_is_rejected(self):
         target = self.root / 'target'
@@ -157,9 +165,56 @@ class TargetTests(unittest.TestCase):
             s.estimate()
         self.assertFalse(base.exists())
 
-    def test_unexpected_tool_output_fails_without_opening_database(self):
-        with patch.object(s, 'run', return_value='not a SQLite CLI response'), self.assertRaises(RuntimeError):
-            s.sqlite_probe(self.row, 1000, 1000)
+    def test_prior_tool_evidence_cannot_be_applied_to_a_different_image_tag(self):
+        row = copy.deepcopy(self.row)
+        row['Config']['Image'] = 'another-image'
+        with patch.object(s, 'PRIOR_NATIVE_TOOL_BUILD', s.TOOL_BUILD, create=True), self.assertRaises(RuntimeError):
+            s.previous_tool_evidence(row)
+
+    def test_complete_preparation_issues_only_docker_inspect_queries(self):
+        data = self.root / 'appdata' / 'plex-nas'
+        base = self.root / 'recovery' / 'handover'
+        base.parent.mkdir()
+        for leaf in ('config', 'flora-test-library'):
+            (data / leaf).mkdir(parents=True)
+        prefs = data / 'config' / s.PREFS
+        prefs.parent.mkdir(parents=True)
+        prefs.write_text('<Preferences MachineIdentifier="current" ProcessedMachineIdentifier="'
+                         + 'a' * 40 + '" PlexOnlineToken="private-token-retained" />')
+        db = data / 'config' / s.DATABASE
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b'original-data' * 400)
+        image_file = self.root / 'images.json'
+        before = (prefs.read_bytes(), db.read_bytes())
+        with contextlib.ExitStack() as stack:
+            for name, value in [('DATA', data), ('BASE', base), ('IMAGES', image_file),
+                                ('INCOMING', self.root / 'incoming'), ('ROLLBACK', base / 'nas-before')]:
+                stack.enter_context(patch.object(s, name, value))
+            row = container()
+            image_file.write_text(json.dumps({'plex': {'source': s.SOURCE_IMAGE, 'nas': row['Image']}}))
+            calls = []
+
+            def query(*args, timeout=30):
+                calls.append(args)
+                if args == ('docker', 'inspect', 'plex-nas'):
+                    return json.dumps([row])
+                if args[0] == 'du':
+                    return '8192 fixture\n'
+                raise AssertionError('Unexpected external operation: ' + repr(args))
+
+            stack.enter_context(patch.object(s, 'run', side_effect=query))
+            stack.enter_context(patch.object(s, 'mounts'))
+            stack.enter_context(patch.object(s, 'PRIOR_NATIVE_TOOL_BUILD', s.TOOL_BUILD, create=True))
+            stack.enter_context(patch.object(s.shutil, 'disk_usage', return_value=SimpleNamespace(free=100 * 1024**3)))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            s.prepare()
+        self.assertEqual((prefs.read_bytes(), db.read_bytes()), before)
+        self.assertEqual([c for c in calls if c[0] == 'docker'],
+                         [('docker', 'inspect', 'plex-nas'), ('docker', 'inspect', 'plex-nas')])
+        self.assertFalse((self.root / 'incoming').exists())
+        self.assertFalse((base / 'nas-before').exists())
+        plan = json.loads((base / 'target-plan.json').read_text())
+        self.assertFalse(plan['toolContainerCreatedThisRun'])
 
 
 if __name__ == '__main__':

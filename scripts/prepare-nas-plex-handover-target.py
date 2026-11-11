@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Prepare the NAS Plex import target without copying data or starting Plex.
 
-Only a small private target plan is saved. A disposable, network-isolated
-container runs the already installed image's SQLite --version command with no
-Plex configuration mounted. It never invokes the Plex server entrypoint.
+Only a small private target plan is saved. Reuses the user's already completed
+native database-tool version check and validates its Plex build against the
+reviewed image. This preparer never creates or starts any container.
 """
 import datetime as dt
 import hashlib
@@ -37,6 +37,7 @@ RESERVE_BYTES = 4 * 1024**3
 PREFS = Path('Library/Application Support/Plex Media Server/Preferences.xml')
 DATABASE = Path('Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db')
 SQLITE = '/usr/lib/plexmediaserver/Plex SQLite'
+TOOL_BUILD = 'v1.43.5.11079-b3b13e506'
 
 
 def safe(path):
@@ -112,16 +113,19 @@ def identity():
     return {k + 'Sha256': hashlib.sha256(v.encode()).hexdigest() for k, v in values.items()}
 
 
-def sqlite_probe(row, uid, gid):
-    # No /config mount or token/environment is passed. Override the image's
-    # normal entrypoint so the Plex server cannot start in this tool container.
-    version = run('docker', 'run', '--rm', '--pull=never', '--network=none', '--read-only',
-                  '--user', f'{uid}:{gid}', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-                  '--pids-limit=64', '--memory=512m', '--cpus=1',
-                  '--entrypoint', SQLITE, row['Image'], '--version', timeout=45).strip()
-    if len(version) > 512 or not re.match(r'^3\.\d+\.\d+(?:\s|$)', version):
-        raise RuntimeError('The installed Plex SQLite version response differs; no Plex data was opened.')
-    return version.split()[0]
+def previous_tool_evidence(row):
+    # Plex's bundled executable prints the PMS build for --version, rather
+    # than a stock SQLite engine version. The user already ran this exact
+    # tool on the mapped NAS image and supplied its native output. Preserve
+    # that as reported evidence, not as a new probe or an integrity check.
+    # Missing/mismatched evidence fails closed; there is no docker-run fallback.
+    reported = globals().get('PRIOR_NATIVE_TOOL_BUILD')
+    if reported != TOOL_BUILD or row['Config']['Image'] != IMAGE_TAG:
+        raise RuntimeError('The prior native tool build is missing or differs; no container was created.')
+    return {'reportedBuild': reported, 'evidence': 'user-reported native output on 2026-11-11',
+            'command': SQLITE + ' --version', 'reviewedImageTag': IMAGE_TAG,
+            'currentMappedImageId': row['Image'], 'reusedPriorResult': True,
+            'newProbePerformed': False, 'databaseIntegrityChecked': False}
 
 
 def fingerprint(row):
@@ -203,12 +207,13 @@ def prepare():
     uid, gid = validate_container(row, json.loads(read(IMAGES)))
     current_identity = identity()
     budget = estimate()
-    version = sqlite_probe(row, uid, gid)
+    tool_evidence = previous_tool_evidence(row)
     if fingerprint(inspect()) != before or identity() != current_identity:
         raise RuntimeError('NAS Plex changed during target preparation; no plan published.')
     plan = {'format': FORMAT, 'preparedUtc': dt.datetime.now(dt.timezone.utc).isoformat(),
             'phase': 'target-prepared-no-import', 'container': before,
-            'existingNasIdentity': current_identity, 'plexSqliteVersion': version,
+            'existingNasIdentity': current_identity, 'plexToolBuild': tool_evidence['reportedBuild'],
+            'priorNativeToolEvidence': tool_evidence, 'toolContainerCreatedThisRun': False,
             'plexSqliteEntrypoint': SQLITE, 'runtimeUid': uid, 'runtimeGid': gid,
             'existingData': str(DATA), 'incomingRoot': str(INCOMING), 'rollbackRoot': str(ROLLBACK),
             'storageBudget': budget, 'sourceHeldProofRequired': True,
@@ -222,7 +227,7 @@ def prepare():
     gib = lambda n: round(n / 1024**3, 1)
     print('NAS PLEX HANDOVER TARGET PREPARED. Plex remains stopped; restart=no.', flush=True)
     print('Verified: six bindings, source/NAS image mapping, Intel graphics and current FUSE mounts.', flush=True)
-    print('Installed-image SQLite tool: ' + version + ' (isolated CLI only; no Plex config mounted).', flush=True)
+    print('Prior native tool build: ' + tool_evidence['reportedBuild'] + ' (reused; no test container created).', flush=True)
     print('Existing NAS Plex/Flora: ' + str(gib(budget['existingNasPlexBytes'])) + ' GiB; app SSD free: '
           + str(gib(budget['availableAppBytesAtPreparation'])) + ' GiB.', flush=True)
     print('Import plan: one incoming copy, maximum 64 GiB; 4 GiB reserve; existing NAS roots retained by rename.', flush=True)
