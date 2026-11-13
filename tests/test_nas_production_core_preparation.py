@@ -112,7 +112,11 @@ class PrivatePreparation(unittest.TestCase):
         self.assertFalse(s.image_content_matches({}, {}))
 
     def test_compose_replay_escapes_runtime_env_once_and_preserves_existing_command(self):
-        live_file = self.root / 'compose.json'; live_file.write_text('original live Compose retained')
+        canonical = self.root / 'appdata/dockmon/stacks/media-core-nas/compose.yaml'
+        canonical.parent.mkdir(parents=True)
+        canonical.write_text('original live Compose retained')
+        live_file = self.root / 'compose/media-core-nas/compose.json'
+        live_file.parent.mkdir(parents=True); live_file.symlink_to(canonical)
         candidate = self.root / 'private'; candidate.mkdir()
         model = {'name': 'media-core-nas', 'services': {'sonarr': {'container_name': 'sonarr-nas',
                  'environment': {'ORIGINAL': 'old'}, 'command': ['echo', '$$KEEP'],
@@ -125,12 +129,69 @@ class PrivatePreparation(unittest.TestCase):
         def run(*args, **kwargs):
             filename = Path(args[args.index('-f') + 1])
             return json.dumps(model) if filename == live_file else filename.read_text()
-        with patch.object(s, 'NAMES', {'sonarr': 'sonarr-nas'}), patch.object(s, 'run', side_effect=run):
+        with patch.object(s, 'APP', self.root), patch.object(s, 'NAMES', {'sonarr': 'sonarr-nas'}), patch.object(s, 'run', side_effect=run):
             result = s.prepare_composes(candidate, runtime, source, policy, {})
         actual = json.loads(Path(result[0]['candidate']).read_text())
         self.assertEqual(actual['services']['sonarr']['environment'], {'KEY': '$$actual'})
         self.assertEqual(actual['services']['sonarr']['command'], ['echo', '$$KEEP'])
         self.assertEqual(live_file.read_text(), 'original live Compose retained')
+        self.assertTrue(live_file.is_symlink())
+        self.assertEqual(result[0]['sourceFiles'], {str(canonical): hashlib.sha256(canonical.read_bytes()).hexdigest()})
+        self.assertEqual(result[0]['sourceLinkTargets'], {str(live_file): str(canonical)})
+
+    def test_only_exact_reviewed_dockmon_links_are_accepted(self):
+        with patch.object(s, 'APP', self.root):
+            for project in ('media-core-nas', 'infinidysk-nas'):
+                canonical = self.root / 'appdata/dockmon/stacks' / project / 'compose.yaml'
+                canonical.parent.mkdir(parents=True); canonical.write_text('private config')
+                legacy = self.root / 'compose' / project / 'compose.json'
+                legacy.parent.mkdir(parents=True); legacy.symlink_to(canonical)
+                self.assertEqual(s.compose_source(project, str(legacy)), canonical)
+                self.assertEqual(s.compose_source(project, str(canonical)), canonical)
+                with self.assertRaises(RuntimeError):
+                    s.compose_source('different-project', str(legacy))
+                legacy.unlink(); legacy.symlink_to(self.root / 'unexpected')
+                with self.assertRaises(RuntimeError):
+                    s.compose_source(project, str(legacy))
+
+    def test_compatibility_link_cannot_hide_another_symlink(self):
+        project = 'media-core-nas'
+        canonical = self.root / 'appdata/dockmon/stacks' / project / 'compose.yaml'
+        canonical.parent.mkdir(parents=True)
+        actual = self.root / 'another-file'; actual.write_text('private config')
+        canonical.symlink_to(actual)
+        legacy = self.root / 'compose' / project / 'compose.json'
+        legacy.parent.mkdir(parents=True); legacy.symlink_to(canonical)
+        with patch.object(s, 'APP', self.root), self.assertRaises(RuntimeError):
+            s.compose_source(project, str(legacy))
+        canonical.unlink(); canonical.write_text('private config')
+        moved = self.root / 'moved'; canonical.parent.rename(moved)
+        canonical.parent.symlink_to(moved, target_is_directory=True)
+        with patch.object(s, 'APP', self.root), self.assertRaises(RuntimeError):
+            s.compose_source(project, str(legacy))
+
+    def test_worker_upgrade_preserves_exact_pinned_previous_copy(self):
+        previous, updated = b'previous pinned worker', b'new reviewed worker'
+        worker = self.root / 'worker.py'; worker.write_bytes(previous)
+        with patch.object(s, 'BASE', self.root), patch.object(s, 'WORKER', worker), \
+                patch.object(s, 'PRIOR_WORKER_SHA', hashlib.sha256(previous).hexdigest()):
+            s.install_worker(updated)
+            self.assertEqual(worker.read_bytes(), updated)
+            self.assertEqual((self.root / 'worker.before-dockmon-link-fix.py').read_bytes(), previous)
+            s.install_worker(updated)  # exact retries are idempotent
+            worker.write_bytes(b'unrecognized change')
+            with self.assertRaises(RuntimeError):
+                s.install_worker(updated)
+            self.assertEqual(worker.read_bytes(), b'unrecognized change')
+
+    def test_worker_cannot_be_replaced_while_preparation_lock_is_held(self):
+        import fcntl
+        worker = self.root / 'worker.py'; worker.write_bytes(b'running worker')
+        with (self.root / '.run.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(s, 'BASE', self.root), patch.object(s, 'WORKER', worker), self.assertRaises(RuntimeError):
+                s.install_worker(b'replacement')
+        self.assertEqual(worker.read_bytes(), b'running worker')
 
     def test_no_activation_or_mutating_docker_command_exists(self):
         import ast

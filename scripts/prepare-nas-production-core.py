@@ -34,6 +34,7 @@ POLICY = BASE / 'production-policy.py'
 POLICY_URL = 'https://raw.githubusercontent.com/sawdoctor/nas-backup-auth/c5dc33f5d2ec8fc29075a86177d35ac545408379/scripts/production-core-policy.py'
 POLICY_SHA = 'a0f66984a66a0d402840528c82e5f52437a76e7f14c3fadf06e882887012e6c2'
 UNIT = 'nas-production-core-prepare.service'
+PRIOR_WORKER_SHA = '24386952b1ace1ccc18eaf321e02c90974c2657df779aaad1cd97335cba1a021'
 NAMES = {'sonarr': 'sonarr-nas', 'radarr': 'radarr-nas', 'radarr4k': 'radarr4k-nas',
          'prowlarr': 'prowlarr-nas', 'usenet-ultimate': 'usenet-ultimate-nas',
          'overseerr': 'seerr-nas', 'nzbdav': 'infinidysk-nas'}
@@ -323,6 +324,24 @@ def comparable_compose(model):
     return result
 
 
+def compose_source(project, filename):
+    """Accept only the two installed Dockmon compatibility links, as inputs."""
+    path = Path(filename)
+    safe(path.parent)
+    if path.is_symlink():
+        if project not in ('media-core-nas', 'infinidysk-nas'):
+            raise RuntimeError('An unrecognized symbolic Compose input was retained.')
+        legacy = APP / 'compose' / project / 'compose.json'
+        canonical = APP / 'appdata/dockmon/stacks' / project / 'compose.yaml'
+        if path != legacy or os.readlink(path) != str(canonical):
+            raise RuntimeError('A Dockmon Compose compatibility link differs; it was retained.')
+        path = canonical
+    safe(path)
+    if not path.is_file() or path.stat().st_size > 2 * 1024**2:
+        raise RuntimeError('A bounded current Compose source is unavailable.')
+    return path
+
+
 def prepare_composes(candidate, runtime, source_rows, policy, infini):
     groups = {}
     for name, nas_name in NAMES.items():
@@ -335,13 +354,17 @@ def prepare_composes(candidate, runtime, source_rows, policy, infini):
         if project not in groups:
             command = ['docker', 'compose', '-p', project]
             hashes = {}
+            links = {}
             for filename in files:
-                path = Path(filename); safe(path)
-                command += ['-f', filename]; hashes[filename] = digest(path)
+                path = compose_source(project, filename)
+                command += ['-f', filename]; hashes[str(path)] = digest(path)
+                if str(path) != filename:
+                    links[filename] = str(path)
             document = json.loads(run(*command, 'config', '--format', 'json'))
-            groups[project] = {'document': document, 'sourceFiles': hashes, 'services': []}
+            groups[project] = {'document': document, 'sourceFiles': hashes,
+                               'labelFiles': files, 'sourceLinkTargets': links, 'services': []}
         group = groups[project]
-        if set(files) != set(group['sourceFiles']):
+        if files != group['labelFiles']:
             raise RuntimeError('A NAS Compose project has inconsistent source-file labels.')
         if group['document']['services'].get(service, {}).get('container_name') != nas_name:
             raise RuntimeError('A current NAS Compose service identity differs.')
@@ -360,7 +383,12 @@ def prepare_composes(candidate, runtime, source_rows, policy, infini):
         normalized = json.loads(run('docker', 'compose', '-p', project, '-f', str(path), 'config', '--format', 'json'))
         if comparable_compose(normalized) != comparable_compose(group['document']):
             raise RuntimeError('A private proposed Compose round trip differs; live files were retained.')
+        if (any(str(compose_source(project, filename)) != group['sourceLinkTargets'].get(filename, filename)
+                for filename in group['labelFiles'])
+                or any(digest(Path(filename)) != expected for filename, expected in group['sourceFiles'].items())):
+            raise RuntimeError('A current Compose input changed during preparation; live files retained.')
         result.append({'project': project, 'sourceFiles': group['sourceFiles'], 'candidate': str(path),
+                       'sourceFileLabels': group['labelFiles'], 'sourceLinkTargets': group['sourceLinkTargets'],
                        'candidateSha256': digest(path), 'services': group['services']})
     return result
 
@@ -384,6 +412,11 @@ def prepare():
         image_matches = {name: image_content_matches(source_images.get(source_rows[name]['Image'], {}),
                          nas_images[runtime[nas_name]['Image']]) for name, nas_name in NAMES.items()}
         mappings, live = layout(source, manifest, runtime)
+        # Catch unexpected inputs before copying or adapting any private database.
+        for row in runtime.values():
+            labels = row['Config'].get('Labels') or {}
+            for filename in labels.get('com.docker.compose.project.config_files', '').split(','):
+                compose_source(labels.get('com.docker.compose.project'), filename)
         candidate = BASE / record['createdUtc']; safe(candidate)
         marker = {'format': FORMAT, 'sourceArchiveSha256': record['sha256']}
         if candidate.exists():
@@ -396,6 +429,10 @@ def prepare():
                     raise RuntimeError('The existing private candidate identity differs.')
                 if (any(fingerprint(runtime[n]) != value for n, value in plan['nasContainerFingerprints'].items())
                         or any(digest(Path(item['candidate'])) != item['candidateSha256']
+                               or any(digest(Path(filename)) != expected
+                                      for filename, expected in item['sourceFiles'].items())
+                               or any(str(compose_source(item['project'], filename)) != target
+                                      for filename, target in item.get('sourceLinkTargets', {}).items())
                                for item in plan['composeProposals'])):
                     raise RuntimeError('The prepared runtime/Compose inputs changed; existing copies retained.')
                 say('Production core candidate already prepared privately for ' + record['createdUtc'] + '. No activation.'); return
@@ -414,6 +451,7 @@ def prepare():
                 '--checksum', '--', str(source / relative) + '/', str(target) + '/', timeout=3600)
         say('Verifying selected copied files against the source checksum list...')
         checked = verify_copied_files(source, data, mappings)
+        say('Source checksums passed: ' + str(checked) + ' selected files. Checking library IDs and runtime compatibility...')
         coverage = library_coverage(data)
         source_schema = schema(data / 'nzbdav/db.sqlite')
         nas_schema = schema(live['nzbdav'] / 'db.sqlite')
@@ -458,6 +496,27 @@ def prepare():
         say('Private plan: ' + str(candidate / 'plan.json'))
 
 
+def install_worker(source):
+    lock = BASE / '.run.lock'; safe(lock)
+    with lock.open('a') as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Private preparation is running; its worker was retained.') from None
+        if WORKER.exists():
+            previous = read(WORKER)
+            if previous == source:
+                return
+            if hashlib.sha256(previous).hexdigest() != PRIOR_WORKER_SHA:
+                raise RuntimeError('A different preparation worker exists; it was retained.')
+            saved = BASE / 'worker.before-dockmon-link-fix.py'; safe(saved)
+            if saved.exists() and read(saved) != previous:
+                raise RuntimeError('A different earlier preparation worker was retained.')
+            if not saved.exists():
+                atomic(saved, previous)
+        atomic(WORKER, source)
+
+
 def main():
     os.umask(0o077)
     if os.geteuid() != 0 or 'inet 192.168.0.220/' not in run('ip', '-4', 'addr', 'show'):
@@ -469,15 +528,14 @@ def main():
     if sys.argv[1:]:
         raise RuntimeError('This preparer has no activation or service-control arguments.')
     owner()
+    if subprocess.run(['systemctl', 'is-active', '--quiet', UNIT], capture_output=True).returncode == 0:
+        say('The private production preparation is already running; check its journal.'); return
     source = globals().get('INSTALL_SOURCE')
     if not isinstance(source, str):
         if Path(__file__).resolve() != WORKER:
             raise RuntimeError('The pinned complete installer source is required.')
         source = WORKER.read_text()
-    if WORKER.exists() and read(WORKER) != source.encode():
-        raise RuntimeError('A different preparation worker exists; it was retained.')
-    if not WORKER.exists():
-        atomic(WORKER, source.encode())
+    install_worker(source.encode())
     if not POLICY.exists():
         body = urllib.request.urlopen(POLICY_URL, timeout=30).read()
         if hashlib.sha256(body).hexdigest() != POLICY_SHA:
