@@ -72,6 +72,8 @@ def containers(core):
     rows = json.loads(core.run('docker', 'inspect', *core.NAMES.values()))
     return {row['Name'].lstrip('/'): {**core.fingerprint(row),
             'startedAt': row['State'].get('StartedAt'), 'restartCount': row.get('RestartCount'),
+            'running': row['State'].get('Running'), 'status': row['State'].get('Status'),
+            'finishedAt': row['State'].get('FinishedAt'),
             'restartPolicy': row['HostConfig']['RestartPolicy']} for row in rows}
 
 
