@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -143,6 +144,14 @@ class ProductionPolicy(unittest.TestCase):
         self.assertEqual(actual.findtext('AuthenticationMethod'), 'Forms')
         self.assertIn(s.NAS_IP, actual.findtext('AllowedHosts'))
 
+    def test_source_runtime_json_endpoints_are_retargeted_without_changing_flags(self):
+        raw = json.dumps({'SonarrInstances': [{'Host': 'http://192.168.0.29:8989', 'ApiKey': 'source-key'}],
+                          'QueueRules': [{'Enabled': True, 'Limit': 3}]})
+        actual = s.runtime_environment('nzbdav', {'NZBDAV_CONFIG__ARR__INSTANCES': raw}, {}, self.infini)
+        value = json.loads(actual['NZBDAV_CONFIG__ARR__INSTANCES'])
+        self.assertEqual(value['SonarrInstances'][0]['Host'], 'http://192.168.0.220:8989')
+        self.assertEqual(value['QueueRules'], [{'Enabled': True, 'Limit': 3}])
+
     def test_endpoint_adapter_is_narrow_and_does_not_expose_embedded_secrets(self):
         self.assertEqual(s.endpoint('https://request.sawdoctor.uk'), 'https://request.sawdoctor.uk')
         self.assertEqual(s.endpoint('http://192.168.0.29:12345/other'), 'http://192.168.0.29:12345/other')
@@ -158,6 +167,21 @@ class ProductionPolicy(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(RuntimeError):
                 s.write(self.root, path, b'bad')
         self.assertEqual(outside.read_bytes(), b'retain')
+
+    def test_sqlite_support_permissions_match_the_copied_database(self):
+        path = self.root / 'copied.db'; path.write_bytes(b'db'); path.chmod(0o640)
+        wal = Path(str(path) + '-wal'); wal.write_bytes(b'wal'); wal.chmod(0o600)
+        s.align_auxiliary(self.root, path)
+        self.assertEqual(wal.stat().st_mode & 0o777, 0o640)
+        self.assertEqual((wal.stat().st_uid, wal.stat().st_gid), (path.stat().st_uid, path.stat().st_gid))
+
+    def test_sqlite_support_symlink_cannot_change_an_outside_file(self):
+        path = self.root / 'copied.db'; path.write_bytes(b'db')
+        outside = self.root.parent / 'retained'; outside.write_bytes(b'retain'); outside.chmod(0o600)
+        Path(str(path) + '-wal').symlink_to(outside)
+        with self.assertRaises(RuntimeError):
+            s.align_auxiliary(self.root, path)
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == '__main__':

@@ -104,10 +104,21 @@ def environment(values):
     return dict(v.split('=', 1) for v in values if '=' in v)
 
 
+def environment_value(value):
+    if isinstance(value, str) and value.lstrip().startswith(('{', '[')):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return endpoint(value)
+        updated = connections(parsed)
+        return json.dumps(updated, separators=(',', ':')) if updated != parsed else value
+    return endpoint(value)
+
+
 def runtime_environment(name, source, nas, infini):
     """Restore source behavior and preserve the deliberate NAS runtime adapters."""
     source, nas = environment(source), environment(nas)
-    result = {key: endpoint(value) for key, value in source.items()}
+    result = {key: environment_value(value) for key, value in source.items()}
     for key in MACHINE_ENV:
         if key in nas:
             result[key] = nas[key]
@@ -154,6 +165,20 @@ def check(db):
         raise RuntimeError('A private production restore database failed its integrity check.')
 
 
+def align_auxiliary(root, path):
+    path = fenced(root, path)
+    original = path.stat()
+    for suffix in ('-wal', '-shm', '-journal'):
+        auxiliary = Path(str(path) + suffix)
+        if auxiliary.exists() or auxiliary.is_symlink():
+            fenced(root, auxiliary)
+            if not auxiliary.is_file():
+                raise RuntimeError('A private SQLite support file is not a regular file.')
+            os.chmod(auxiliary, original.st_mode & 0o777)
+            if os.geteuid() == 0:
+                os.chown(auxiliary, original.st_uid, original.st_gid)
+
+
 def patch_arr(root, path, name, keys, ports, infini):
     """Only connection JSON columns change; all policy/queue/history rows survive."""
     db = open_copy(root, path)
@@ -194,6 +219,7 @@ def patch_arr(root, path, name, keys, ports, infini):
         check(db); db.commit()
     finally:
         db.close()
+        align_auxiliary(root, path)
     return changed
 
 
@@ -253,6 +279,7 @@ def patch_infinidysk(root, path):
         check(db); db.commit()
     finally:
         db.close()
+        align_auxiliary(root, path)
     return changed
 
 
