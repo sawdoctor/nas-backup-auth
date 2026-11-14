@@ -5,6 +5,8 @@ import importlib.util
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
+import tarfile
 import tempfile
 import types
 import unittest
@@ -181,6 +183,90 @@ class ProductionBooks(unittest.TestCase):
         m.retain_stopped(native, op, {'kavita-nas', 'sabnzbd-ebooks-nas'})
         self.assertTrue(op['bookWritersStoppedAfterFailure']); self.assertEqual(op['phase'], 'starting')
         self.assertEqual({call[-1] for call in calls}, {'kavita-nas', 'sabnzbd-ebooks-nas'})
+
+    def test_api_database_fallback_preserves_key_and_honors_original_wal(self):
+        database = self.root / 'original.db'
+        with contextlib.closing(sqlite3.connect(database)) as source:
+            source.execute('PRAGMA journal_mode=WAL')
+            source.execute('PRAGMA wal_autocheckpoint=0')
+            source.execute('CREATE TABLE ConfigItems(ConfigName TEXT,ConfigValue TEXT)')
+            source.execute("INSERT INTO ConfigItems VALUES ('api.key','database-key-original')"); source.commit()
+            source.execute("UPDATE ConfigItems SET ConfigValue='database-key-current'"); source.commit()
+            private = self.root / 'copy.db'
+            private.write_bytes(database.read_bytes())
+            Path(str(private) + '-wal').write_bytes(Path(str(database) + '-wal').read_bytes())
+            before = self.native.digest(private)
+            self.assertEqual(m.database_api_key(private, 'frontend-fallback'), 'database-key-current')
+            self.assertEqual(self.native.digest(private), before)
+
+    def test_api_database_uses_frontend_fallback_only_without_database_setting(self):
+        database = self.root / 'original.db'
+        with contextlib.closing(sqlite3.connect(database)) as source:
+            source.execute('CREATE TABLE ConfigItems(ConfigName TEXT,ConfigValue TEXT)'); source.commit()
+        self.assertEqual(m.database_api_key(database, 'frontend-fallback'), 'frontend-fallback')
+        with self.assertRaisesRegex(RuntimeError, 'setting is unavailable'):
+            m.database_api_key(database)
+
+    def test_explicit_source_backend_api_env_needs_no_archive_copy(self):
+        value = m.frozen_api_key(None, None, None, None, None, {'NZBDAV_CONFIG__API__KEY': 'explicit-source-key'})
+        self.assertEqual(value, 'explicit-source-key')
+
+    def archive_fixture(self):
+        raw = self.root / 'raw'; raw.mkdir()
+        source_db = self.root / 'source.db'
+        with contextlib.closing(sqlite3.connect(source_db)) as db:
+            db.execute('CREATE TABLE ConfigItems(ConfigName TEXT,ConfigValue TEXT)')
+            db.execute("INSERT INTO ConfigItems VALUES ('api.key','frozen-original-key')"); db.commit()
+        relative = 'data/infinidysk-config/db.sqlite'
+        (raw / 'SHA256SUMS').write_text(self.native.digest(source_db) + '  ./' + relative + '\n')
+        archive = self.root / 'migration/production-handover/frozen/cutover/export.tar.zst'
+        archive.parent.mkdir(parents=True)
+        with tarfile.open(archive, 'w') as stream: stream.add(source_db, arcname='./' + relative)
+        manifest = {'dataRoots': {'infinidysk-config': {'snapshot': 'data/infinidysk-config', 'kind': 'directory'}}}
+        proof = {'cutoverId': 'cutover', 'archiveBytes': archive.stat().st_size}
+        return raw, source_db, archive, manifest, proof
+
+    def test_source_database_is_read_from_original_hash_checked_archive_not_live_nas(self):
+        raw, original, archive, manifest, proof = self.archive_fixture()
+        popen = subprocess.Popen
+        with patch.multiple(m, WORK=self.root, BACKUP=self.root), patch.object(
+                m.subprocess, 'Popen', side_effect=lambda *a, **k: popen(['cat', str(archive)], **k)):
+            key = m.frozen_api_key(self.native, core, raw, manifest, proof, {})
+        self.assertEqual(key, 'frozen-original-key')
+        self.assertEqual(self.native.digest(self.root / 'credential-source/db.sqlite'), self.native.digest(original))
+        self.assertNotIn(key, (self.root / 'credential-source/evidence.json').read_text())
+
+    def test_archive_database_corruption_is_rejected_without_installing_copy(self):
+        raw, original, archive, manifest, proof = self.archive_fixture()
+        (raw / 'SHA256SUMS').write_text('0' * 64 + '  ./data/infinidysk-config/db.sqlite\n')
+        popen = subprocess.Popen
+        with patch.multiple(m, WORK=self.root, BACKUP=self.root), patch.object(
+                m.subprocess, 'Popen', side_effect=lambda *a, **k: popen(['cat', str(archive)], **k)):
+            with self.assertRaisesRegex(RuntimeError, 'failed its frozen checksum'):
+                m.frozen_api_key(self.native, core, raw, manifest, proof, {})
+        self.assertFalse((self.root / 'credential-source/db.sqlite').exists())
+
+    def test_reviewed_worker_upgrade_retains_old_code_only_before_preparation(self):
+        worker = self.root / 'worker.py'; old = b'previous-reviewed-worker'; worker.write_bytes(old)
+        native = types.SimpleNamespace(**vars(self.native))
+        native.read = lambda p: p.read_bytes()
+        native.atomic = lambda p, value: p.write_bytes(value)
+        native.unit_state = lambda _: {'ActiveState': 'inactive'}
+        with patch.multiple(m, WORK=self.root, SELF=worker, STATE=self.root / 'state.json', PREVIOUS_SHA=m.sha(old)):
+            m.install_worker(native, b'corrected-worker')
+        self.assertEqual(worker.read_bytes(), b'corrected-worker')
+        self.assertEqual((self.root / 'worker.env-only-before.py').read_bytes(), old)
+
+    def test_worker_upgrade_refuses_started_copy_or_unreviewed_worker(self):
+        worker = self.root / 'worker.py'; old = b'previous-reviewed-worker'; worker.write_bytes(old)
+        native = types.SimpleNamespace(**vars(self.native))
+        native.read = lambda p: p.read_bytes()
+        native.unit_state = lambda _: {'ActiveState': 'inactive'}
+        with patch.multiple(m, WORK=self.root, SELF=worker, STATE=self.root / 'state.json', PREVIOUS_SHA=m.sha(old)):
+            (self.root / 'incoming').mkdir()
+            with self.assertRaisesRegex(RuntimeError, 'already-preparing'):
+                m.install_worker(native, b'corrected-worker')
+        self.assertEqual(worker.read_bytes(), old)
 
 
 if __name__ == '__main__': unittest.main()

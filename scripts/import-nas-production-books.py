@@ -12,14 +12,18 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
+
 APP = Path('/srv/dev-disk-by-uuid-e5af079d-1bbd-4ad2-a94b-5a6dbaf8b4d6')
+BACKUP = Path('/srv/dev-disk-by-uuid-631e3391-6a42-4158-9aa4-f7718ba0e7e9')
 BASE = APP / 'compose/production-cutover'
 WORK = BASE / 'books-handover'
 SELF = WORK / 'worker.py'
@@ -37,6 +41,8 @@ ROOTS = ('abr-shelfmark-bridge', 'audiobookrequest', 'kavita', 'sabnzbd',
          'shelfmark-ebooks', 'shelfmark-torbox', 'stackarr-shelfmark',
          'audiobookshelf-data', 'stable-playback-namespace', 'playback-overrides')
 MAX_BYTES = 64 * 1024**3
+PREVIOUS_SHA = '7461cfe86671acb0052a516dcfe575dca9ff14bd81d4ff36009c1aa9eb388a57'
+KEY_DATABASE_LIMIT = 2 * 1024**3
 
 
 def say(value): print(value, flush=True)
@@ -134,6 +140,97 @@ def controls(path):
             columns = {row[1] for row in db.execute('PRAGMA table_info(notification)')}
             if 'enabled' in columns: result['notifications'] = db.execute('SELECT rowid,enabled FROM notification ORDER BY rowid').fetchall()
         return result
+
+
+def database_api_key(path, fallback=None):
+    # Read only our verified private copy, including its original WAL. Never
+    # open the running NAS InfiniDysk database to change/reset a credential.
+    with contextlib.closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as db:
+        if db.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
+            raise RuntimeError('The frozen InfiniDysk credential database failed integrity checking.')
+        values = db.execute("SELECT ConfigValue FROM ConfigItems WHERE ConfigName='api.key'").fetchall()
+    if len(values) > 1: raise RuntimeError('The frozen InfiniDysk API setting is ambiguous.')
+    value = values[0][0] if values else None
+    value = value or fallback
+    if not isinstance(value, str) or not value or '\n' in value or '\r' in value:
+        raise RuntimeError('The current frozen source InfiniDysk API setting is unavailable.')
+    return value
+
+
+def frozen_api_key(native, core, raw, manifest, proof, environment):
+    # This is the precedence already used by the original InfiniDysk NAS
+    # installer: explicit backend API env, ConfigItems/api.key, frontend env.
+    explicit = environment.get('NZBDAV_CONFIG__API__KEY')
+    if explicit: return explicit
+    descriptor = manifest['dataRoots'].get('infinidysk-config', {})
+    if descriptor.get('snapshot') != 'data/infinidysk-config' or descriptor.get('kind') != 'directory':
+        raise RuntimeError('The frozen InfiniDysk settings locator differs.')
+    prefix = 'data/infinidysk-config/db.sqlite'
+    allowed = {prefix, prefix + '-wal'}; checks = {}
+    with (raw / 'SHA256SUMS').open('r', encoding='utf-8', errors='surrogateescape') as stream:
+        for line in stream:
+            if len(line) > 65536: raise RuntimeError('A frozen credential checksum entry exceeds its bound.')
+            name, digest = core.parse_checksum(line)
+            if name in allowed:
+                if name in checks: raise RuntimeError('A frozen credential checksum is duplicated.')
+                checks[name] = digest
+    if prefix not in checks: raise RuntimeError('The original frozen InfiniDysk database checksum is unavailable.')
+    folder = WORK / 'credential-source'; native.safe(folder); folder.mkdir(mode=0o700, exist_ok=True)
+    database = folder / 'db.sqlite'
+    retained = {name: folder / PurePosixPath(name).name for name in checks}
+    for name, path in retained.items():
+        native.safe(path)
+        if path.exists() and (path.stat().st_size > KEY_DATABASE_LIMIT or native.digest(path) != checks[name]):
+            raise RuntimeError('A retained frozen credential file differs; it was not overwritten.')
+    wal = folder / 'db.sqlite-wal'
+    if prefix + '-wal' not in checks and wal.exists():
+        raise RuntimeError('An unexpected frozen credential WAL was retained.')
+    missing = {name for name, path in retained.items() if not path.exists()}
+    if missing:
+        archive = BACKUP / 'migration/production-handover/frozen' / proof['cutoverId'] / 'export.tar.zst'
+        native.safe(archive)
+        if archive.stat().st_size != proof['archiveBytes'] or shutil.disk_usage(WORK).free < 1024**3:
+            raise RuntimeError('The retained frozen archive or credential-copy reserve differs.')
+        say('Reading the original InfiniDysk settings database/WAL from the retained verified frozen archive...')
+        process = subprocess.Popen(['zstd', '-dc', '--', str(archive)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            with tarfile.open(fileobj=process.stdout, mode='r|') as source:
+                for member in source:
+                    relative = str(PurePosixPath(member.name))
+                    if relative not in missing: continue
+                    if (not member.isfile() or not 0 <= member.size <= KEY_DATABASE_LIMIT
+                            or (relative == prefix and member.size < 100)):
+                        raise RuntimeError('A frozen InfiniDysk credential member exceeds its bound or is symbolic.')
+                    if shutil.disk_usage(WORK).free < member.size + 1024**3:
+                        raise RuntimeError('The bounded frozen credential copy lacks its disk reserve.')
+                    target = retained[relative]
+                    fd, temporary = tempfile.mkstemp(prefix='.credential-', dir=folder)
+                    try:
+                        value = hashlib.sha256(); received = 0
+                        with os.fdopen(fd, 'wb') as output, source.extractfile(member) as original:
+                            while block := original.read(1024**2):
+                                received += len(block)
+                                if received > member.size: raise RuntimeError('A frozen credential member exceeded its declared size.')
+                                output.write(block); value.update(block)
+                            output.flush(); os.fsync(output.fileno())
+                        if received != member.size or value.hexdigest() != checks[relative]:
+                            raise RuntimeError('The original InfiniDysk credential file failed its frozen checksum.')
+                        Path(temporary).replace(target); native.sync_dir(folder)
+                    finally: Path(temporary).unlink(missing_ok=True)
+                    missing.remove(relative)
+                    if not missing: break
+            if missing: raise RuntimeError('A required frozen InfiniDysk credential member is unavailable.')
+        finally:
+            process.stdout.close()
+            if process.poll() is None:
+                process.terminate()
+                try: process.wait(timeout=10)
+                except subprocess.TimeoutExpired: process.kill(); process.wait(timeout=10)
+    value = database_api_key(database, environment.get('FRONTEND_BACKEND_API_KEY'))
+    native.atomic(folder / 'evidence.json', {'format': 'sawdoctor-frozen-infini-key-reader-v1',
+                                          'cutoverId': proof['cutoverId'], 'filesSha256': checks})
+    say('Frozen source InfiniDysk API setting resolved; no credential values printed or changed.')
+    return value
 
 
 def install_adapters(books, roots, infini_key_pairs):
@@ -385,10 +482,12 @@ def worker():
                     raise RuntimeError('An existing SABnzbd tag changed during exact caching.')
                 infini_name = core.NAMES['nzbdav']
                 old_env = starter.environment(source['nzbdav']); new_env = starter.environment(rows[infini_name])
-                old_key = old_env.get('FRONTEND_BACKEND_API_KEY') or old_env.get('NZBDAV_CONFIG__API__KEY')
-                new_key = new_env.get('FRONTEND_BACKEND_API_KEY') or new_env.get('NZBDAV_CONFIG__API__KEY')
-                if not old_key or not new_key: raise RuntimeError('Current source/NAS InfiniDysk API adapters are unavailable.')
+                old_key = frozen_api_key(native, core, raw, manifest, main['proof'], old_env)
+                new_key = new_env.get('NZBDAV_CONFIG__API__KEY') or new_env.get('FRONTEND_BACKEND_API_KEY')
+                if not new_key: raise RuntimeError('The running NAS InfiniDysk API environment is unavailable; no key was reset.')
                 secrets = install_adapters(books, roots, [(old_key, new_key)])
+                if shutil.disk_usage(APP).free < size + 4 * 1024**3:
+                    raise RuntimeError('Book copy/reserve space after the bounded credential copy is insufficient.')
                 incoming = WORK / 'incoming'; native.safe(incoming)
                 if incoming.exists(): raise RuntimeError('An earlier private book copy was retained.')
                 incoming.mkdir(mode=0o755)
@@ -437,6 +536,21 @@ def worker():
     say('Rollback roots: ' + str(WORK / 'rollback'))
 
 
+def install_worker(native, encoded):
+    if native.unit_state('nas-production-books.service')['ActiveState'] in ('active', 'activating', 'deactivating'):
+        raise RuntimeError('The book production handover is already active.')
+    if SELF.exists() and native.read(SELF) != encoded:
+        if (native.digest(SELF) != PREVIOUS_SHA or STATE.exists()
+                or (WORK / 'incoming').exists() or (WORK / 'rollback').exists()):
+            raise RuntimeError('A different or already-preparing book worker was retained.')
+        before = WORK / 'worker.env-only-before.py'
+        if before.exists() and native.digest(before) != PREVIOUS_SHA:
+            raise RuntimeError('An unrelated previous-worker recovery file was retained.')
+        if not before.exists(): native.atomic(before, native.read(SELF))
+        native.atomic(SELF, encoded)
+    if not SELF.exists(): native.atomic(SELF, encoded)
+
+
 def main():
     os.umask(0o077)
     if os.geteuid() != 0 or not APP.is_mount() or 'inet 192.168.0.220/' not in subprocess.check_output(['ip', '-4', 'addr', 'show'], text=True, timeout=10):
@@ -455,10 +569,7 @@ def main():
     if owner.exists() and json.loads(native.read(owner)) != {'format': FORMAT}: raise RuntimeError('An unrelated book work folder was retained.')
     if not owner.exists(): native.atomic(owner, {'format': FORMAT})
     encoded = source.encode()
-    if SELF.exists() and native.read(SELF) != encoded: raise RuntimeError('A different book worker was retained.')
-    if not SELF.exists(): native.atomic(SELF, encoded)
-    if native.unit_state('nas-production-books.service')['ActiveState'] in ('active', 'activating', 'deactivating'):
-        raise RuntimeError('The book production handover is already active.')
+    install_worker(native, encoded)
     native.run('systemd-run', '--unit=nas-production-books', '--collect', '--description=Import current frozen book state into existing NAS mounts',
                '--property=Type=exec', '--property=Nice=10', '--property=TimeoutStopSec=30',
                '/usr/bin/python3', str(SELF), '--worker', sha(encoded))
