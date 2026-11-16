@@ -22,10 +22,12 @@ SELF = WORK / 'resume.py'
 STATE = WORK / 'resume-state.json'
 PREVIOUS = WORK / 'worker.py'
 PREVIOUS_SHA = '63eed55a06c85c951455207918f4e95abd868f8acd540900e1db2a84ad5a8dfc'
+PREVIOUS_RESUME_SHA = '6355f7412190996ac35f1b6c6126b7fdee0154ad9137c48c0e80b2f260e2517b'
 BASELINE_SET = 'nas-20261115T091448Z'
 UNIT = 'nas-production-application-controls-resume.service'
 FORMAT = 'sawdoctor-reviewed-application-controls-resume-v1'
 DNS = ('Dns', 'DnsOptions', 'DnsSearch')
+OWNER_KEYS = ('com.docker.compose.project', 'com.docker.compose.service', 'com.docker.compose.project.config_files', 'com.docker.compose.project.working_dir')
 
 
 def say(value): print(value, flush=True)
@@ -48,7 +50,7 @@ def normalized_host_config(value):
     return result
 
 
-def validate_runtime(old, before, after, definition, image):
+def validate_runtime(old, before, after, definition, image, expected_owner=None):
     if before['Image'] != after['Image']: raise RuntimeError('A selected current image changed.')
     if old.mounts(before) != old.mounts(after): raise RuntimeError('A selected persistent/media binding changed.')
     if old.networks(before) != old.networks(after): raise RuntimeError('A selected network/alias binding changed.')
@@ -67,10 +69,9 @@ def validate_runtime(old, before, after, definition, image):
     if left != right:
         fields = sorted(key for key in left.keys() | right.keys() if left.get(key) != right.get(key))
         raise RuntimeError('Unrelated Config differences retained for review: ' + ', '.join(fields))
-    keys = ('com.docker.compose.project', 'com.docker.compose.service', 'com.docker.compose.project.config_files', 'com.docker.compose.project.working_dir')
-    for key in keys:
-        if (before['Config'].get('Labels') or {}).get(key) != (after['Config'].get('Labels') or {}).get(key):
-            raise RuntimeError('A selected Compose owner changed.')
+    expected_owner = expected_owner if expected_owner is not None else {key: (before['Config'].get('Labels') or {}).get(key) for key in OWNER_KEYS}
+    changed = [key for key in OWNER_KEYS if expected_owner.get(key) != (after['Config'].get('Labels') or {}).get(key)]
+    if changed: raise RuntimeError('Current Compose owner differs from the verified definition: ' + ', '.join(changed))
     return [field for field in DNS if before['HostConfig'].get(field) != after['HostConfig'].get(field)]
 
 
@@ -82,6 +83,20 @@ def verify_prepared_files(native, record):
                 raise RuntimeError('A retained/current scheduler definition changed; no file overwritten.')
 
 
+def verified_current_owner(native, task, record):
+    context = task['context']; paths = context['files']
+    tracked = {Path(item['path']): item for item in record['files']}
+    if len(paths) != 1 or paths[0] not in tracked:
+        raise RuntimeError('The current Compose owner points outside the recorded scheduler definition.')
+    if native.digest(paths[0]) != tracked[paths[0]]['afterSha256']:
+        raise RuntimeError('The current owner definition differs from the prepared checksum.')
+    matches = [service for service, definition in task['model']['services'].items()
+               if definition.get('container_name') == task['name']]
+    if matches != [task['service']] or task['definition'].get('container_name') != task['name']:
+        raise RuntimeError('The recorded current definition does not uniquely own the selected container.')
+    return dict(zip(OWNER_KEYS, (context['project'], task['service'], ','.join(str(path) for path in paths), str(context['directory']))))
+
+
 def task_for(native, startup, current, name, expected_image):
     row = current[name]
     if not row['State']['Running'] or row['Image'] != expected_image: raise RuntimeError('A selected running version differs from the reviewed operation.')
@@ -89,7 +104,7 @@ def task_for(native, startup, current, name, expected_image):
     definition = model['services'][service]
     if startup.local_image(definition['image']) != expected_image: raise RuntimeError('A selected current Compose image tag moved; no pull or recreation requested.')
     image = json.loads(native.run('docker', 'image', 'inspect', '--', row['Image']))[0]
-    return {'name': name, 'before': row, 'context': context, 'service': service, 'definition': definition, 'imageInfo': image}
+    return {'name': name, 'before': row, 'context': context, 'service': service, 'definition': definition, 'imageInfo': image, 'model': model}
 
 
 def recreate_speedtest(old, native, startup, task):
@@ -100,7 +115,7 @@ def recreate_speedtest(old, native, startup, task):
     command += ['up', '-d', '--no-deps', '--pull', 'never', '--no-build', task['service']]
     native.run(*command, timeout=240)
     after = old.wait_http(native, 'speedtest-tracker-nas', 8765)
-    validate_runtime(old, before, after, task['definition'], task['imageInfo'])
+    validate_runtime(old, before, after, task['definition'], task['imageInfo'], task['expectedOwner'])
     return after
 
 
@@ -139,6 +154,11 @@ def worker(old, review, boot, backup, native, startup):
     with boot.boot_lock(native):
         main, current = backup.preflight(native); body, record = check_record(old, native, main)
         report = old.reviewed_report(native, main)
+        inventory = kuma_inventory(review, native, current, report); native.atomic(WORK / 'kuma-current-monitor-inventory.json', inventory)
+        say('KUMA CURRENT MONITOR INVENTORY (read-only; URL paths/query credentials withheld): ' + json.dumps(inventory, sort_keys=True))
+        status = native.run('systemctl', 'show', 'nas-backup.service', '--no-pager', '-p', 'ActiveState', '-p', 'Result',
+                            '-p', 'ConditionResult', '-p', 'ExecMainStartTimestamp', '-p', 'ExecMainExitTimestamp')
+        say('BACKUP LAST RUN (read-only): ' + json.dumps(dict(line.split('=', 1) for line in status.splitlines() if '=' in line), sort_keys=True))
         houndarr = current['houndarr-nas']
         if houndarr['Image'] != record['images']['houndarr-nas']: raise RuntimeError('The completed Houndarr version changed; retained.')
         path = review.current_database(houndarr, 'houndarr.db', native)
@@ -151,13 +171,19 @@ def worker(old, review, boot, backup, native, startup):
         before = before[0]
         if any(old.env(before).get(field) != 'true' for field in old.ENV['wizarr-nas']): raise RuntimeError('The saved Wizarr staging baseline differs.')
         wizarr_task = task_for(native, startup, current, 'wizarr-nas', record['images']['wizarr-nas'])
+        wizarr_task['expectedOwner'] = verified_current_owner(native, wizarr_task, record)
         wizarr = old.wait_http(native, 'wizarr-nas', 5690)
-        accepted_dns = validate_runtime(old, before, wizarr, wizarr_task['definition'], wizarr_task['imageInfo'])
+        accepted_dns = validate_runtime(old, before, wizarr, wizarr_task['definition'], wizarr_task['imageInfo'], wizarr_task['expectedOwner'])
+        owner_changes = {key: {'saved': (before['Config'].get('Labels') or {}).get(key), 'current': (wizarr['Config'].get('Labels') or {}).get(key)}
+                         for key in OWNER_KEYS if (before['Config'].get('Labels') or {}).get(key) != (wizarr['Config'].get('Labels') or {}).get(key)}
+        say('WIZARR CURRENT COMPOSE OWNER VERIFIED against the recorded prepared file: ' + json.dumps(wizarr_task['expectedOwner'], sort_keys=True))
+        say('Wizarr historical owner-label differences (metadata only): ' + json.dumps(owner_changes, sort_keys=True))
         if any(old.env(wizarr).get(field, '').lower() not in ('', 'false', '0') for field in old.ENV['wizarr-nas']):
             raise RuntimeError('A Wizarr scheduler override remains enabled.')
         say('WIZARR ACCEPTED: healthy current image/settings/bindings; only empty DNS representations and generated hostname normalized. No Wizarr restart.')
         say('Wizarr empty-DNS fields accepted: ' + ', '.join(accepted_dns))
         speed = task_for(native, startup, current, 'speedtest-tracker-nas', record['images']['speedtest-tracker-nas'])
+        speed['expectedOwner'] = verified_current_owner(native, speed, record)
         if speed['definition'].get('environment', {}).get('SPEEDTEST_SCHEDULE') != '30 4 * * *':
             raise RuntimeError('The already prepared original Speedtest schedule differs.')
         baseline_path = WORK / 'resume-speedtest-before.json'
@@ -182,7 +208,7 @@ def worker(old, review, boot, backup, native, startup):
             if schedule == '': row = recreate_speedtest(old, native, startup, speed)
             elif schedule == '30 4 * * *':
                 row = old.wait_http(native, 'speedtest-tracker-nas', 8765)
-                validate_runtime(old, speed['before'], row, speed['definition'], speed['imageInfo'])
+                validate_runtime(old, speed['before'], row, speed['definition'], speed['imageInfo'], speed['expectedOwner'])
             else: raise RuntimeError('A current Speedtest schedule was changed separately; retained.')
             if old.env(row).get('SPEEDTEST_SCHEDULE') != '30 4 * * *': raise RuntimeError('The original Speedtest schedule was not retained.')
             say('SPEEDTEST RESTORED: 30 4 * * *; same image, storage, networks and remaining runtime settings verified.')
@@ -199,14 +225,23 @@ def worker(old, review, boot, backup, native, startup):
             subprocess.run(['systemctl', 'reset-failed', old.UNIT], capture_output=True)
         except BaseException:
             state['phase'] = 'needs-review'; native.atomic(STATE, state); raise
-        inventory = kuma_inventory(review, native, final, report); native.atomic(WORK / 'kuma-current-monitor-inventory.json', inventory)
-        say('KUMA CURRENT MONITOR INVENTORY (read-only; URL paths/query credentials withheld): ' + json.dumps(inventory, sort_keys=True))
-        status = native.run('systemctl', 'show', 'nas-backup.service', '--no-pager', '-p', 'ActiveState', '-p', 'Result',
-                            '-p', 'ConditionResult', '-p', 'ExecMainStartTimestamp', '-p', 'ExecMainExitTimestamp')
-        say('BACKUP LAST RUN (read-only): ' + json.dumps(dict(line.split('=', 1) for line in status.splitlines() if '=' in line), sort_keys=True))
     say('REVIEWED NAS APPLICATION CONTROLS RESTORED. Completed Houndarr/Wizarr retained; pending Speedtest schedule active on its current image.')
     say('No Houndarr/Wizarr restart, image pull, application data restore, source/cron/job/NPM/Tracearr or Kuma control change.')
     say('Small resume record: ' + str(STATE))
+
+
+def install_resume(native, source):
+    data = source.encode()
+    if SELF.exists() and native.read(SELF) != data:
+        previous = native.read(SELF)
+        if sha(previous) != PREVIOUS_RESUME_SHA or STATE.exists() or (WORK / 'resume-speedtest-before.json').exists():
+            raise RuntimeError('A different or already-progressed resume worker was retained.')
+        retained = WORK / 'resume-before-owner-fix.py'
+        if retained.exists() and native.read(retained) != previous: raise RuntimeError('A retained pre-fix resume differs.')
+        if not retained.exists(): native.atomic(retained, previous)
+        native.atomic(SELF, data, reference=SELF)
+        say('Corrected only the pinned resume ownership check; previous source retained. No application changed by installation.')
+    elif not SELF.exists(): native.atomic(SELF, data, mode=0o700)
 
 
 def main():
@@ -223,8 +258,7 @@ def main():
     with native.lock(BASE / '.run.lock'):
         if backup.unit(native, UNIT).get('ActiveState') in ('active', 'activating', 'deactivating'):
             say('Reviewed application resume is already running.'); return
-        if SELF.exists() and native.read(SELF) != source.encode(): raise RuntimeError('A different resume worker was retained.')
-        if not SELF.exists(): native.atomic(SELF, source.encode(), mode=0o700)
+        install_resume(native, source)
         subprocess.run(['systemctl', 'reset-failed', UNIT], capture_output=True)
         native.run('systemd-run', '--unit=' + UNIT, '--collect', '--property=Type=exec', '--property=UMask=0077', '--property=RuntimeMaxSec=20min',
                    '--description=Accept verified current Wizarr and activate only pending Speedtest schedule', '/usr/bin/python3', '-u', str(SELF), '--worker')

@@ -59,13 +59,22 @@ class ApplicationControlsResumeTests(unittest.TestCase):
         if custom_dns:wizarr['HostConfig']['Dns']=['1.1.1.1']
         current={'wizarr-nas':wizarr,'houndarr-nas':runtime('houndarr-nas'),'speedtest-tracker-nas':runtime('speedtest-tracker-nas',values={'SPEEDTEST_SCHEDULE':''}),
                  'plex-nas':runtime('plex-nas')}
+        live=work/'prepared.yaml';live.write_bytes(b'current reviewed scheduler definition')
+        prior=work/'before.yaml';prior.write_bytes(b'previous scheduler definition')
+        candidate=work/'candidate.yaml';candidate.write_bytes(live.read_bytes())
+        for name in ('wizarr-nas','speedtest-tracker-nas'):
+            current[name]['Config']['Labels'].update({'com.docker.compose.project.config_files':str(live),'com.docker.compose.project.working_dir':str(work)})
+        before['Config']['Labels'].update({'com.docker.compose.project':'legacy-support','com.docker.compose.service':'wizarr',
+            'com.docker.compose.project.config_files':'/legacy/compose.json','com.docker.compose.project.working_dir':'/legacy'})
         database=work/'houndarr.db'
         with sqlite3.connect(database) as db:
             db.execute('CREATE TABLE instances(id INTEGER,url TEXT,enabled INTEGER,missing_enabled INTEGER,cutoff_enabled INTEGER,upgrade_enabled INTEGER,encrypted_api_key TEXT)')
             db.executemany('INSERT INTO instances VALUES(?,?,1,1,0,0,?)',[(1,'http://radarr:7878','CIPHER1'),(2,'http://radarr4k:7878','CIPHER2'),(3,'http://sonarr:8989','CIPHER3')])
         baseline=folder/'backup/backups/sets'/m.BASELINE_SET/'containers.json';baseline.parent.mkdir(parents=True);baseline.write_text(json.dumps([before]))
         original=work/'state.json'; original.write_text(json.dumps({'format':old.FORMAT,'cutoverId':'current','phase':'needs-review',
-            'completed':['houndarr-nas'],'files':[],'images':{name:current[name]['Image'] for name in old.NAMES}}))
+            'completed':['houndarr-nas'],'files':[{'path':str(live),'before':str(prior),'prepared':str(candidate),
+                'beforeSha256':hashlib.sha256(prior.read_bytes()).hexdigest(),'afterSha256':hashlib.sha256(live.read_bytes()).hexdigest()}],
+            'images':{name:current[name]['Image'] for name in old.NAMES}}))
         active=work/'import-active';active.write_text('remaining jobs held')
         calls=[]
         def run(*args,**kwargs):
@@ -84,7 +93,8 @@ class ApplicationControlsResumeTests(unittest.TestCase):
         fake_review=SimpleNamespace(database=review.database,arr_identity=review.arr_identity,flag=review.flag,current_database=lambda row,relative,native:database)
         fake_boot=SimpleNamespace(boot_lock=lambda native:contextlib.nullcontext(),runtime_signature=boot.runtime_signature)
         backup=SimpleNamespace(BACKUP=folder/'backup',preflight=lambda native:({'proof':{'cutoverId':'current'}},copy.deepcopy(current)))
-        model={'services':{'wizarr-nas':definition,'speedtest-tracker-nas':{'image':'current:latest','environment':{'SPEEDTEST_SCHEDULE':'30 4 * * *'}}}}
+        definition['container_name']='wizarr-nas'
+        model={'services':{'wizarr-nas':definition,'speedtest-tracker-nas':{'container_name':'speedtest-tracker-nas','image':'current:latest','environment':{'SPEEDTEST_SCHEDULE':'30 4 * * *'}}}}
         startup=SimpleNamespace(compose_context=lambda row:{'project':'support','directory':work,'files':(work/'prepared.yaml',)},
             compose_model=lambda native,context:copy.deepcopy(model),service_for=lambda model,row:row['Name'].lstrip('/'),local_image=lambda reference:before['Image'])
         return work,database,original,current,calls,(fake_old,fake_review,fake_boot,backup,native,startup)
@@ -102,6 +112,41 @@ class ApplicationControlsResumeTests(unittest.TestCase):
             self.assertEqual(json.loads(original.read_bytes())['phase'],'complete')
             self.assertEqual(json.loads((work/'resume-state.json').read_bytes())['phase'],'complete')
             self.assertFalse(any(call[:2] in (('docker','start'),('docker','stop'),('docker','restart')) for call in calls))
+
+    def test_active_ownership_is_checked_against_the_recorded_current_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work,db,original,current,calls,args=self.fixture(Path(temporary))
+            fake_old,fake_review,fake_boot,backup,native,startup=args
+            record=json.loads(original.read_bytes())
+            task=m.task_for(native,startup,current,'wizarr-nas',current['wizarr-nas']['Image'])
+            owner=m.verified_current_owner(native,task,record)
+            saved=json.loads((backup.BACKUP/'backups/sets'/m.BASELINE_SET/'containers.json').read_bytes())[0]
+            with self.assertRaisesRegex(RuntimeError,'Compose owner'):
+                m.validate_runtime(fake_old,saved,current['wizarr-nas'],task['definition'],task['imageInfo'])
+            m.validate_runtime(fake_old,saved,current['wizarr-nas'],task['definition'],task['imageInfo'],owner)
+            unknown=copy.deepcopy(task);unknown['context']['files']=(work/'unrecorded.yaml',)
+            with self.assertRaisesRegex(RuntimeError,'outside the recorded'):
+                m.verified_current_owner(native,unknown,record)
+            wrong=copy.deepcopy(current['wizarr-nas']);wrong['Config']['Labels']['com.docker.compose.service']='unrelated'
+            with self.assertRaisesRegex(RuntimeError,'com.docker.compose.service'):
+                m.validate_runtime(fake_old,saved,wrong,task['definition'],task['imageInfo'],owner)
+            duplicate=copy.deepcopy(task);duplicate['model']['services']['duplicate']=duplicate['definition']
+            with self.assertRaisesRegex(RuntimeError,'uniquely own'):
+                m.verified_current_owner(native,duplicate,record)
+
+    def test_installer_replaces_only_the_unprogressed_exact_previous_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work=Path(temporary);path=work/'resume.py';state=work/'resume-state.json';previous=b'pinned previous resume';path.write_bytes(previous)
+            native=SimpleNamespace(read=lambda path:path.read_bytes(),atomic=lambda path,value,**kwargs:path.write_bytes(value))
+            with patch.object(m,'WORK',work),patch.object(m,'SELF',path),patch.object(m,'STATE',state),patch.object(m,'PREVIOUS_RESUME_SHA',hashlib.sha256(previous).hexdigest()):
+                m.install_resume(native,'new reviewed resume')
+                self.assertEqual(path.read_bytes(),b'new reviewed resume');self.assertEqual((work/'resume-before-owner-fix.py').read_bytes(),previous)
+                path.write_bytes(b'unrecognized worker')
+                with self.assertRaisesRegex(RuntimeError,'different or already-progressed'):m.install_resume(native,'new reviewed resume')
+                self.assertEqual(path.read_bytes(),b'unrecognized worker')
+                path.write_bytes(previous);state.write_bytes(b'progress retained')
+                with self.assertRaisesRegex(RuntimeError,'different or already-progressed'):m.install_resume(native,'new reviewed resume')
+                self.assertEqual(path.read_bytes(),previous)
 
     def test_custom_dns_stops_before_any_pending_recreation(self):
         with tempfile.TemporaryDirectory() as temporary:
