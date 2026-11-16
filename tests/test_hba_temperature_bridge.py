@@ -22,11 +22,19 @@ class HbaTemperatureBridgeTests(unittest.TestCase):
         verify.assert_not_called(); run.assert_not_called()
 
     def test_inactive_cron_runs_only_the_unchanged_existing_collector(self):
-        with patch.object(m, 'verified'), patch.object(m, 'cron_state', return_value='inactive'), \
-                patch('builtins.open', mock_open()), patch.object(m.fcntl, 'flock'), \
-                patch.object(m, 'cached_temperature', return_value=59), patch.object(m.subprocess, 'run') as run:
-            self.assertEqual(m.collect(), 59)
-        run.assert_called_once_with([str(m.COLLECTOR)], capture_output=True, timeout=20, check=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / 'cache'
+            cache.write_text('58\n')
+            def collect_once(*args, **kwargs):
+                replacement = cache.with_suffix('.tmp')
+                replacement.write_text('59\n')
+                replacement.replace(cache)
+            with patch.object(m, 'CACHE', cache), patch.object(m, 'verified'), \
+                    patch.object(m, 'cron_state', return_value='inactive'), \
+                    patch('builtins.open', mock_open()), patch.object(m.fcntl, 'flock'), \
+                    patch.object(m.subprocess, 'run', side_effect=collect_once) as run:
+                self.assertEqual(m.collect(), 59)
+            run.assert_called_once_with([str(m.COLLECTOR)], capture_output=True, timeout=20, check=True)
 
     def test_boot_collection_does_not_load_migration_or_source_controllers(self):
         with patch.object(m.sys, 'argv', ['worker.py', '--collect']), patch.object(m, 'collect') as collect, \

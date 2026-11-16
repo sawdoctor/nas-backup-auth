@@ -33,7 +33,21 @@ unchanged.
 
 There is no Python executor in this session. The Python regression suite
 has NOT been executed here. The repair worker must run all eight cases
-on the NAS before patching. Native success is still pending.
+on the NAS before patching.
+
+Subsequent native result: all eight isolated cases passed, the exact
+corrected worker was installed, and an initial 60 C reading was followed
+by a second scheduled cache refresh. The final general preflight stopped
+on stale shelfmark-ebooks-nas media bindings, so completion records were
+not closed even though collection had progressed. The user then ran the
+existing nas-media-recovery.service and its check reported no unavailable
+or old mounts and zero pending backup recovery records.
+
+The reviewed Kuma handover will accept HBA completion only from the exact
+fixed worker/unit/collector identities, a currently enabled/active timer,
+a successful collector service, a fresh numeric cache, and two separate
+recent successful collector journal entries. It does not rerun the
+collector or alter any unit. This final native acceptance remains pending.
 
 Remaining migration scope: restore the already reviewed 15 Kuma monitors,
 original notification associations and reviewed endpoints, then original
