@@ -73,9 +73,12 @@ def collect():
             say('HBA BRIDGE SKIPPED: a previous bridge collection is still running.'); return None
         if cron_state() not in ('inactive', 'failed'):
             say('HBA BRIDGE SKIPPED: cron ownership is changing.'); return None
-        before_ns = time.time_ns()
+        previous_cache = CACHE.stat() if CACHE.exists() else None
         subprocess.run([str(COLLECTOR)], capture_output=True, timeout=20, check=True)
-        temperature = cached_temperature(before_ns)
+        temperature = cached_temperature(0)
+        refreshed_cache = CACHE.stat()
+        if previous_cache is not None and (previous_cache.st_dev, previous_cache.st_ino) == (refreshed_cache.st_dev, refreshed_cache.st_ino):
+            raise RuntimeError('The existing HBA collector did not replace its cache.')
     say('HBA TEMPERATURE COLLECTED: ' + str(temperature) + ' C; original collector retained.')
     return temperature
 
