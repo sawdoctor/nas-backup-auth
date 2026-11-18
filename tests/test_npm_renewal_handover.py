@@ -4,7 +4,7 @@ import io
 from pathlib import Path
 import tarfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 PATH = Path(__file__).resolve().parents[1] / 'scripts/resume-nas-npm-certificate-renewal.py'
 spec = importlib.util.spec_from_file_location('npm_renewal', PATH)
@@ -115,6 +115,20 @@ class NpmRenewalHandoverTests(unittest.TestCase):
             npm.verify_runtime(before, after)
         self.assertIn('PRIVATE_KEY', str(raised.exception))
         self.assertNotIn('SECRET-VALUE', str(raised.exception))
+
+    def test_proxy_preflight_checks_accepted_local_owner_not_unrelated_media_mounts(self):
+        native, host, backup = Mock(), Mock(), Mock()
+        native.FORMAT = 'current-format'
+        native.read.side_effect = [b'{"phase":"awaiting-acceptance","proof":{"cutoverId":"current"}}',
+                                   b'{"format":"current-format","cutoverId":"current"}',
+                                   b'{"phase":"complete","cutoverId":"current"}']
+        host.status.return_value = {'ActiveState': 'inactive'}
+        native.catalog.return_value = {'npm-nas': {'Image': npm.IMAGE}}
+        main, rows = npm.local_proxy_preflight(host, backup, native)
+        native.held.assert_called_once_with({'cutoverId': 'current'})
+        native.helpers.assert_not_called()
+        backup.preflight.assert_not_called()
+        self.assertIn('npm-nas', rows)
 
 
 if __name__ == '__main__':

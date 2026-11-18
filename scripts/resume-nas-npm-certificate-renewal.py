@@ -279,12 +279,29 @@ def finish_proof(native, record):
     say('NAS NPM STOCK RENEWAL OWNER ACTIVE. Same image, storage, routes and access controls retained.')
 
 
+def local_proxy_preflight(host, backup, native):
+    # NPM uses local SSD storage. Reopening media/FUSE acceptance here would
+    # couple a certificate handover to unrelated book mount transients.
+    native.approved(backup.PLAN_SHA)
+    main = json.loads(native.read(native.STATE))
+    require(main.get('phase') == 'awaiting-acceptance' and main.get('proof', {}).get('cutoverId'),
+            'The accepted current NAS import identity is unavailable.')
+    require(json.loads(native.read(native.ACTIVE)) == {'format': native.FORMAT, 'cutoverId': main['proof']['cutoverId']},
+            'The separate final migration hold identity differs.')
+    completed = json.loads(native.read(host.STATE))
+    require(completed.get('phase') == 'complete' and completed.get('cutoverId') == main['proof']['cutoverId'],
+            'The reviewed host schedule handover is not complete for this NAS import.')
+    require(host.status(native, 'nas-backup.service')['ActiveState'] not in ('active', 'activating', 'deactivating'),
+            'The normal NAS backup is busy; retain it and retry after completion.')
+    native.held(main['proof'])
+    return main, native.catalog()
+
+
 def worker(host, boot, backup, native):
     with native.lock(BASE / '.run.lock'):
         record = json.loads(native.read(STATE)) if STATE.exists() else None
         with boot.boot_lock(native):
-            main, rows = backup.preflight(native)
-            require(json.loads(native.read(host.STATE)).get('phase') == 'complete', 'The reviewed host schedules are not complete.')
+            main, rows = local_proxy_preflight(host, backup, native)
             before = rows['npm-nas']
             require(before['State']['Running'] and before['Image'] == IMAGE, 'The reviewed current NPM image changed; no pull or downgrade.')
             native.held(main['proof'])

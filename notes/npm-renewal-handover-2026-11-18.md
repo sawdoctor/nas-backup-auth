@@ -35,9 +35,10 @@ production remains frozen. The shared NAS backup lock is released before waiting
 for renewal outcomes. A still-expired enabled certificate is reported explicitly
 without claiming it is fixed. This handover is not final migration acceptance.
 
-Ten local regressions cover scoped mount removal, unstarted/existing-network
+Eleven local regressions cover scoped mount removal, unstarted/existing-network
 handling, exact runtime ports/environment/storage/policy protection, current-image
-module checks, safe bounded tar reads and secret-free mismatch messages. Native
+module checks, safe bounded tar reads, secret-free mismatch messages and scoped
+local-storage/source-owner preflight without reopening unrelated media/FUSE acceptance. Native
 execution remains pending. Official v2.16.0 certificate.js was reviewed to confirm
 immediate and hourly sequential expiry processing; the installed image's own
 module remains authoritative instead of copying that public version into NPM.
