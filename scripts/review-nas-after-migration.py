@@ -228,6 +228,15 @@ def retired_proxy():
         connection.close()
 
 
+def resources():
+    memory = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())
+    samples = [json.loads(line) for line in checked('docker', 'stats', '--no-stream', '--format', '{{json .}}').decode().splitlines()]
+    return {'memory': {key: memory[key].strip() for key in ('MemTotal', 'MemAvailable', 'SwapTotal', 'SwapFree')},
+            'baselineContainers': [{key: row.get(key) for key in ('Name', 'CPUPerc', 'MemUsage', 'MemPerc', 'PIDs')}
+                                   for row in samples if any(value in row.get('Name', '')
+                                   for value in ('dockmon', 'infinidysk', 'silo', 'plex'))]}
+
+
 def part(label, function, report):
     print('Checking ' + label + '...', flush=True)
     try: value = function()
@@ -257,6 +266,7 @@ def worker():
          'cronActive': rows['cron.service'].get('ActiveState') == 'active'}, report)
     part('cleanup_inventory', lambda: disk_and_cleanup(containers), report)
     part('retired_proxy', retired_proxy, report)
+    part('resources', resources, report)
     part('comparison_environment', lambda: {'dockerSocketGid': Path('/var/run/docker.sock').stat().st_gid,
          'backupProgramSha256': hashlib.sha256(small(Path('/usr/local/sbin/nas-backup'))).hexdigest(),
          'containers': [{'name': r['Name'].lstrip('/'), 'image': r['Config']['Image'],
