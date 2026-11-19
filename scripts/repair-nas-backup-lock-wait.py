@@ -114,11 +114,23 @@ def new_run(current, record):
     return bool(value and value not in ('n/a', '0') and value != record['backupStartBefore'])
 
 
-def capture(current):
+def journal_selection(current):
     invocation = current.get('InvocationID', '')
+    if re.fullmatch('[a-f0-9]{32}', invocation):
+        return ['_SYSTEMD_INVOCATION_ID=' + invocation]
+    moments = []
+    for key in ('ExecMainStartTimestamp', 'ExecMainExitTimestamp'):
+        value = current.get(key, '')
+        match = re.fullmatch(r'[A-Za-z]{3} (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (?:GMT|UTC)', value)
+        require(match, 'The failed invocation time needs review; no broad historical failure will authorize a patch.')
+        moments.append(int(dt.datetime.fromisoformat(match[1]).replace(tzinfo=dt.timezone.utc).timestamp()))
+    require(0 <= moments[1] - moments[0] <= 10, 'The failed backup duration differs from this immediate startup failure.')
+    return ['--since', '@' + str(moments[0] - 1), '--until', '@' + str(moments[1] + 1)]
+
+
+def capture(current):
     args = ['journalctl', '-u', 'nas-backup.service', '--no-pager', '-o', 'cat', '-n', '150']
-    if re.fullmatch('[a-f0-9]{32}', invocation): args.append('_SYSTEMD_INVOCATION_ID=' + invocation)
-    else: args += ['--since', 'today']
+    args += journal_selection(current)
     journal = command(*args).decode(errors='replace')
     others = {name: properties(name) for name in ('nas-media-recovery.service', 'nas-torbox-audiobook-archive.service')}
     owners = subprocess.run(['lslocks', '--json', '-o', 'PID,COMMAND,TYPE,MODE,PATH'], capture_output=True, timeout=15)

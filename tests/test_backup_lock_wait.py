@@ -39,6 +39,14 @@ class BackupLockWaitTests(unittest.TestCase):
         self.assertFalse(repair.new_run({'ExecMainStartTimestamp': 'old'}, record))
         self.assertTrue(repair.new_run({'ExecMainStartTimestamp': 'new'}, record))
 
+    def test_journal_is_limited_to_the_actual_failed_invocation(self):
+        self.assertEqual(repair.journal_selection({'InvocationID': 'a' * 32}), ['_SYSTEMD_INVOCATION_ID=' + 'a' * 32])
+        selected = repair.journal_selection({'ExecMainStartTimestamp': 'Thu 2026-11-19 02:00:04 GMT',
+                                            'ExecMainExitTimestamp': 'Thu 2026-11-19 02:00:04 GMT'})
+        self.assertEqual(selected[0], '--since')
+        self.assertEqual(int(selected[3][1:]) - int(selected[1][1:]), 2)
+        with self.assertRaises(RuntimeError): repair.journal_selection({'InvocationID': ''})
+
     def test_real_waiting_flock_acquires_after_current_owner_finishes(self):
         with tempfile.TemporaryDirectory() as directory:
             lock_path = Path(directory) / 'lock'

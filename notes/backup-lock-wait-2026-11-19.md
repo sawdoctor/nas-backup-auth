@@ -29,7 +29,7 @@ the existing backup's behavior. It neither kills a competing archive/recovery
 job nor starts a second backup process directly. A pending recovery or stopped
 container is reported as follow-up, not silently accepted.
 
-Seven local regressions pass, including real flock wait/release and timeout
+Eight local regressions pass, including real flock wait/release and timeout
 tests. The exact retained full backup program also passes the replacement SHA
 and bash syntax checks locally. Actual failure confirmation, patch and new
 backup are pending native execution. Cleanup and both comparison/test projects
